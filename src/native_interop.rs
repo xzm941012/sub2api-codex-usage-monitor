@@ -1,5 +1,5 @@
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -18,6 +18,7 @@ pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
+pub const TIMER_EDGE_ANIMATION: usize = 5;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
@@ -48,6 +49,41 @@ pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
             Ok(h) if h != HWND::default() => Some(h),
             _ => None,
         }
+    }
+}
+
+/// Find a descendant window by class name.
+pub fn find_descendant_window(parent: HWND, class_name: &str) -> Option<HWND> {
+    unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut FindDescendantState);
+        let mut class_buf = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut class_buf);
+        if len > 0 {
+            let class = String::from_utf16_lossy(&class_buf[..len as usize]);
+            if class == state.class_name {
+                state.found = Some(hwnd);
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+
+    struct FindDescendantState {
+        class_name: String,
+        found: Option<HWND>,
+    }
+
+    unsafe {
+        let mut state = FindDescendantState {
+            class_name: class_name.to_string(),
+            found: None,
+        };
+        let _ = EnumChildWindows(
+            parent,
+            Some(enum_child),
+            LPARAM(&mut state as *mut FindDescendantState as isize),
+        );
+        state.found
     }
 }
 
@@ -96,6 +132,36 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
         let _ = SetParent(hwnd, taskbar_hwnd);
+    }
+}
+
+/// Detach our window from the taskbar and keep it as a no-activate topmost popup.
+pub fn float_as_topmost(hwnd: HWND) {
+    unsafe {
+        let _ = SetParent(hwnd, HWND::default());
+
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongW(
+            hwnd,
+            GWL_EXSTYLE,
+            ex_style
+                | WS_EX_TOOLWINDOW.0 as i32
+                | WS_EX_LAYERED.0 as i32
+                | WS_EX_NOACTIVATE.0 as i32,
+        );
+
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let new_style = (style & !WS_CHILD_STYLE) | WS_POPUP_STYLE | WS_CLIPSIBLINGS_STYLE;
+        let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
     }
 }
 

@@ -12,16 +12,19 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    VK_LBUTTON, VK_RBUTTON,
+};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
+use crate::models::{AccountUsageDetail, AppUsageData, UsageData, UsageSection};
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_EDGE_ANIMATION, TIMER_POLL, TIMER_RESET_POLL,
+    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::theme;
@@ -46,6 +49,7 @@ impl SendHwnd {
 /// Shared application state
 struct AppState {
     hwnd: SendHwnd,
+    detail_hwnd: Option<SendHwnd>,
     taskbar_hwnd: Option<HWND>,
     tray_notify_hwnd: Option<HWND>,
     win_event_hook: Option<HWINEVENTHOOK>,
@@ -65,6 +69,20 @@ struct AppState {
     codex_weekly_text: String,
     show_claude_code: bool,
     show_codex: bool,
+    placement_mode: PlacementMode,
+    widget_theme: WidgetTheme,
+    progress_color_mode: ProgressColorMode,
+    floating_x: Option<i32>,
+    floating_y: Option<i32>,
+    edge_collapse: EdgeCollapse,
+    edge_expanded: bool,
+    mouse_tracking: bool,
+    edge_animation: Option<EdgeAnimation>,
+    detail_visible: bool,
+    detail_mouse_down_seen: bool,
+    sub2api_groups: Vec<poller::Sub2apiGroup>,
+    sub2api_groups_loading: bool,
+    sub2api_groups_loaded: bool,
 
     data: Option<AppUsageData>,
 
@@ -81,9 +99,22 @@ struct AppState {
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
+    drag_start_mouse_y: i32,
     drag_start_offset: i32,
+    drag_start_floating_x: i32,
+    drag_start_floating_y: i32,
 
     widget_visible: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EdgeAnimation {
+    from_x: i32,
+    to_x: i32,
+    y: i32,
+    height: i32,
+    start: Instant,
+    duration: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -95,8 +126,63 @@ enum UpdateStatus {
     Available(ReleaseDescriptor),
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PlacementMode {
+    Fixed,
+    Floating,
+}
+
+impl Default for PlacementMode {
+    fn default() -> Self {
+        Self::Fixed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WidgetTheme {
+    Light,
+    Dark,
+}
+
+impl Default for WidgetTheme {
+    fn default() -> Self {
+        Self::Dark
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProgressColorMode {
+    Mono,
+    Antd,
+}
+
+impl Default for ProgressColorMode {
+    fn default() -> Self {
+        Self::Mono
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EdgeCollapse {
+    None,
+    Left,
+    Right,
+}
+
+impl Default for EdgeCollapse {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
 
+const POLL_10_SEC: u32 = 10_000;
+const POLL_30_SEC: u32 = 30_000;
 const POLL_1_MIN: u32 = 60_000;
 const POLL_5_MIN: u32 = 300_000;
 const POLL_15_MIN: u32 = 900_000;
@@ -107,27 +193,47 @@ const IDM_FREQ_1MIN: u16 = 10;
 const IDM_FREQ_5MIN: u16 = 11;
 const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
+const IDM_FREQ_10SEC: u16 = 14;
+const IDM_FREQ_30SEC: u16 = 15;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
-const IDM_LANG_SYSTEM: u16 = 40;
-const IDM_LANG_ENGLISH: u16 = 41;
-const IDM_LANG_DUTCH: u16 = 42;
-const IDM_LANG_SPANISH: u16 = 43;
-const IDM_LANG_FRENCH: u16 = 44;
-const IDM_LANG_GERMAN: u16 = 45;
-const IDM_LANG_JAPANESE: u16 = 46;
-const IDM_LANG_KOREAN: u16 = 47;
-const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
-const IDM_LANG_RUSSIAN: u16 = 49;
-const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
+const IDM_PLACEMENT_FIXED: u16 = 70;
+const IDM_PLACEMENT_FLOATING: u16 = 71;
+const IDM_THEME_LIGHT: u16 = 72;
+const IDM_THEME_DARK: u16 = 73;
+const IDM_COLOR_MONO: u16 = 74;
+const IDM_COLOR_ANTD: u16 = 75;
+const IDM_LANG_SYSTEM: u16 = 100;
+const IDM_LANG_ENGLISH: u16 = 101;
+const IDM_LANG_DUTCH: u16 = 102;
+const IDM_LANG_SPANISH: u16 = 103;
+const IDM_LANG_FRENCH: u16 = 104;
+const IDM_LANG_GERMAN: u16 = 105;
+const IDM_LANG_JAPANESE: u16 = 106;
+const IDM_LANG_KOREAN: u16 = 107;
+const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 108;
+const IDM_LANG_TRADITIONAL_CHINESE: u16 = 109;
+const IDM_LANG_RUSSIAN: u16 = 110;
+const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 111;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
+const IDM_GROUP_REFRESH: u16 = 120;
+const IDM_GROUP_BASE: u16 = 1000;
+const IDM_GROUP_MAX: u16 = 1199;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
+const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
+const DETAIL_ROW_HEIGHT: i32 = 126;
+const DETAIL_PANEL_WIDTH: i32 = 306;
+const DETAIL_PANEL_PADDING: i32 = 7;
+const DETAIL_PANEL_MAX_ROWS: usize = 6;
+const TIMER_DETAIL_OUTSIDE: usize = 6;
+const TIMER_DETAIL_RENDER: usize = 7;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+const WM_APP_SUB2API_GROUPS_UPDATED: u32 = WM_APP + 4;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
@@ -215,6 +321,36 @@ struct SettingsFile {
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
     show_codex: bool,
+    #[serde(default)]
+    placement_mode: PlacementMode,
+    #[serde(default)]
+    widget_theme: WidgetTheme,
+    #[serde(default)]
+    progress_color_mode: ProgressColorMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floating_x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floating_y: Option<i32>,
+    #[serde(default)]
+    edge_collapse: EdgeCollapse,
+    #[serde(default)]
+    usage_mode: poller::UsageMode,
+    #[serde(default)]
+    sub2api: poller::Sub2apiConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached_usage: Option<CachedUsageFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachedUsageFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_session_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_session_resets_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_weekly_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_weekly_resets_at_unix: Option<u64>,
 }
 
 impl Default for SettingsFile {
@@ -225,8 +361,17 @@ impl Default for SettingsFile {
             language: None,
             last_update_check_unix: None,
             widget_visible: true,
-            show_claude_code: true,
-            show_codex: false,
+            show_claude_code: false,
+            show_codex: true,
+            placement_mode: PlacementMode::Fixed,
+            widget_theme: WidgetTheme::Dark,
+            progress_color_mode: ProgressColorMode::Mono,
+            floating_x: None,
+            floating_y: None,
+            edge_collapse: EdgeCollapse::None,
+            usage_mode: poller::UsageMode::Codex,
+            sub2api: poller::Sub2apiConfig::default(),
+            cached_usage: None,
         }
     }
 }
@@ -240,11 +385,11 @@ fn default_widget_visible() -> bool {
 }
 
 fn default_show_claude_code() -> bool {
-    true
+    false
 }
 
 fn default_show_codex() -> bool {
-    false
+    true
 }
 
 fn load_settings() -> SettingsFile {
@@ -254,8 +399,10 @@ fn load_settings() -> SettingsFile {
     };
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
     if !settings.show_claude_code && !settings.show_codex {
-        settings.show_claude_code = true;
+        settings.show_codex = true;
     }
+    settings.show_claude_code = false;
+    settings.show_codex = true;
     settings
 }
 
@@ -272,6 +419,7 @@ fn save_settings(settings: &SettingsFile) {
 fn save_state_settings() {
     let state = lock_state();
     if let Some(s) = state.as_ref() {
+        let existing = load_settings();
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
             poll_interval_ms: s.poll_interval_ms,
@@ -282,8 +430,64 @@ fn save_state_settings() {
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
+            placement_mode: s.placement_mode,
+            widget_theme: s.widget_theme,
+            progress_color_mode: s.progress_color_mode,
+            floating_x: s.floating_x,
+            floating_y: s.floating_y,
+            edge_collapse: s.edge_collapse,
+            usage_mode: existing.usage_mode,
+            sub2api: existing.sub2api,
+            cached_usage: cached_usage_from_state(s).or(existing.cached_usage),
         });
     }
+}
+
+fn cached_usage_from_state(state: &AppState) -> Option<CachedUsageFile> {
+    if !state.last_poll_ok {
+        return None;
+    }
+    let codex = state.data.as_ref()?.codex.as_ref()?;
+    Some(CachedUsageFile {
+        codex_session_percent: Some(codex.session.percentage),
+        codex_session_resets_at_unix: codex.session.resets_at.and_then(system_time_to_unix_secs),
+        codex_weekly_percent: Some(codex.weekly.percentage),
+        codex_weekly_resets_at_unix: codex.weekly.resets_at.and_then(system_time_to_unix_secs),
+    })
+}
+
+fn app_usage_from_cached(settings: &SettingsFile) -> Option<AppUsageData> {
+    let cached = settings.cached_usage.as_ref()?;
+    let session_percent = cached.codex_session_percent?;
+    let weekly_percent = cached.codex_weekly_percent?;
+    Some(AppUsageData {
+        claude_code: None,
+        codex: Some(UsageData {
+            session: UsageSection {
+                percentage: session_percent,
+                resets_at: cached
+                    .codex_session_resets_at_unix
+                    .map(unix_secs_to_system_time),
+            },
+            weekly: UsageSection {
+                percentage: weekly_percent,
+                resets_at: cached
+                    .codex_weekly_resets_at_unix
+                    .map(unix_secs_to_system_time),
+            },
+            account_details: Vec::new(),
+        }),
+    })
+}
+
+fn system_time_to_unix_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn unix_secs_to_system_time(secs: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(secs)
 }
 
 fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
@@ -467,6 +671,15 @@ fn show_error_message(hwnd: HWND, title: &str, message: &str) {
             MB_OK | MB_ICONERROR,
         );
     }
+}
+
+fn show_first_run_config_message(hwnd: HWND) {
+    let path = settings_path();
+    let message = format!(
+        "未找到配置文件，已创建默认配置文件。\n\n请打开并修改：\n{}\n\n使用 Sub2API 时，至少需要配置：\n- usage_mode: \"Sub2api\"\n- sub2api.base_url\n- sub2api.admin_api_key\n\ngroup_id 不需要手动填写。配置 base_url 和 admin_api_key 后，可在右键菜单的“分组”里切换分组，应用会自动保存。",
+        path.display()
+    );
+    show_info_message(hwnd, "首次配置", &message);
 }
 
 fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor) -> bool {
@@ -817,10 +1030,16 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
+const TEXT_WIDTH: i32 = 82;
 const MODEL_RIGHT_MARGIN: i32 = 5;
-const RIGHT_MARGIN: i32 = 1;
+const RIGHT_MARGIN: i32 = 2;
 const WIDGET_HEIGHT: i32 = 46;
+const FLOATING_WIDGET_HEIGHT: i32 = 58;
+const FLOATING_CORNER_RADIUS: i32 = 10;
+const FLOATING_TRANSPARENT_KEY: u32 = 0x00FF00FF;
+const FLOATING_EDGE_MARGIN: i32 = 18;
+const FLOATING_EDGE_SNAP_DISTANCE: i32 = 28;
+const FLOATING_COLLAPSED_VISIBLE_WIDTH: i32 = 88;
 
 fn active_model_count(show_claude_code: bool, show_codex: bool) -> i32 {
     (show_claude_code as i32 + show_codex as i32).max(1)
@@ -850,18 +1069,75 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex))
+    let main_width =
+        total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex));
+    if state.detail_visible && state.placement_mode == PlacementMode::Floating {
+        main_width.max(sc(DETAIL_PANEL_WIDTH))
+    } else {
+        main_width
+    }
+}
+
+fn detail_row_count_for_state(state: &AppState) -> usize {
+    state
+        .data
+        .as_ref()
+        .and_then(|data| data.codex.as_ref())
+        .map(|codex| codex.account_details.len())
+        .unwrap_or(0)
+        .clamp(1, DETAIL_PANEL_MAX_ROWS)
+}
+
+fn widget_height_for_state(state: &AppState) -> i32 {
+    let base = if state.placement_mode == PlacementMode::Floating {
+        sc(FLOATING_WIDGET_HEIGHT)
+    } else {
+        sc(WIDGET_HEIGHT)
+    };
+    if state.detail_visible && state.placement_mode == PlacementMode::Floating {
+        base + detail_panel_height_for_rows(detail_row_count_for_state(state))
+    } else {
+        base
+    }
+}
+
+fn detail_panel_height_for_rows(rows: usize) -> i32 {
+    sc(DETAIL_PANEL_PADDING * 2 + DETAIL_ROW_HEIGHT * rows as i32 + 12)
+}
+
+fn main_widget_height_for_placement(placement_mode: PlacementMode) -> i32 {
+    if placement_mode == PlacementMode::Floating {
+        sc(FLOATING_WIDGET_HEIGHT)
+    } else {
+        sc(WIDGET_HEIGHT)
+    }
+}
+
+fn current_widget_height() -> i32 {
+    let state = lock_state();
+    state
+        .as_ref()
+        .map(widget_height_for_state)
+        .unwrap_or(sc(WIDGET_HEIGHT))
 }
 
 fn total_widget_width() -> i32 {
-    let active_models = {
+    let state = {
         let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex))
-            .unwrap_or(1)
+        state.as_ref().map(|s| {
+            let main_width =
+                total_widget_width_for(active_model_count(s.show_claude_code, s.show_codex));
+            if s.detail_visible && s.placement_mode == PlacementMode::Floating {
+                main_width.max(sc(DETAIL_PANEL_WIDTH))
+            } else {
+                main_width
+            }
+        })
     };
-    total_widget_width_for(active_models)
+    match state {
+        Some(width) => width,
+        None => total_widget_width_for(1),
+    }
 }
 
 fn claude_accent_color() -> Color {
@@ -923,6 +1199,7 @@ pub fn run() {
     };
 
     let class_name = native_interop::wide_str("ClaudeCodeUsageMonitor");
+    let detail_class_name = native_interop::wide_str("ClaudeCodeUsageDetail");
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
@@ -946,10 +1223,30 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
+        let detail_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(detail_wnd_proc),
+            hInstance: HINSTANCE(hinstance.0),
+            hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            lpszClassName: PCWSTR::from_raw(detail_class_name.as_ptr()),
+            ..Default::default()
+        };
+        let detail_atom = RegisterClassExW(&detail_wc);
+        if detail_atom == 0 {
+            diagnose::log("RegisterClassExW detail returned 0");
+        }
+
+        let settings_file_missing = !settings_path().exists();
         let settings = load_settings();
+        if settings_file_missing {
+            save_settings(&settings);
+        }
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
+        let cached_usage = app_usage_from_cached(&settings);
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(language.strings().window_title);
@@ -963,7 +1260,11 @@ pub fn run() {
             0,
             0,
             total_widget_width_for(initial_model_count),
-            sc(WIDGET_HEIGHT),
+            if settings.placement_mode == PlacementMode::Floating {
+                sc(FLOATING_WIDGET_HEIGHT)
+            } else {
+                sc(WIDGET_HEIGHT)
+            },
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -997,6 +1298,7 @@ pub fn run() {
             let mut state = lock_state();
             *state = Some(AppState {
                 hwnd: SendHwnd::from_hwnd(hwnd),
+                detail_hwnd: None,
                 taskbar_hwnd: None,
                 tray_notify_hwnd: None,
                 win_event_hook: None,
@@ -1015,7 +1317,21 @@ pub fn run() {
                 codex_weekly_text: "--".to_string(),
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
-                data: None,
+                placement_mode: settings.placement_mode,
+                widget_theme: settings.widget_theme,
+                progress_color_mode: settings.progress_color_mode,
+                floating_x: settings.floating_x,
+                floating_y: settings.floating_y,
+                edge_collapse: settings.edge_collapse,
+                edge_expanded: false,
+                mouse_tracking: false,
+                edge_animation: None,
+                detail_visible: false,
+                detail_mouse_down_seen: false,
+                sub2api_groups: Vec::new(),
+                sub2api_groups_loading: false,
+                sub2api_groups_loaded: false,
+                data: cached_usage,
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
                 force_notify_auth_error: false,
@@ -1028,9 +1344,21 @@ pub fn run() {
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
+                drag_start_mouse_y: 0,
                 drag_start_offset: 0,
+                drag_start_floating_x: 0,
+                drag_start_floating_y: 0,
                 widget_visible: settings.widget_visible,
             });
+            if let Some(s) = state.as_mut() {
+                if let Some(codex) = s.data.as_ref().and_then(|data| data.codex.as_ref()) {
+                    s.codex_session_percent = codex.session.percentage;
+                    s.codex_weekly_percent = codex.weekly.percentage;
+                    s.last_poll_ok = true;
+                    refresh_usage_texts(s);
+                    diagnose::log("initialized widget from cached usage");
+                }
+            }
         }
 
         // Try to embed in taskbar
@@ -1093,6 +1421,10 @@ pub fn run() {
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
 
+        if settings_file_missing {
+            show_first_run_config_message(hwnd);
+        }
+
         // Poll timer: 15 minutes
         let initial_poll_ms = {
             let state = lock_state();
@@ -1109,6 +1441,7 @@ pub fn run() {
             diagnose::log("initial poll thread started");
             do_poll(send_hwnd);
         });
+        refresh_sub2api_groups(SendHwnd::from_hwnd(hwnd));
 
         schedule_auto_update_check(hwnd);
         let should_check_updates = {
@@ -1142,7 +1475,7 @@ fn render_layered() {
     let (
         hwnd_val,
         is_dark,
-        embedded,
+        _embedded,
         strings,
         session_pct,
         session_text,
@@ -1154,6 +1487,12 @@ fn render_layered() {
         codex_weekly_text,
         show_claude_code,
         show_codex,
+        placement_mode,
+        widget_theme,
+        progress_color_mode,
+        edge_collapse,
+        edge_expanded,
+        detail_visible,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1172,6 +1511,12 @@ fn render_layered() {
                 s.codex_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
+                s.placement_mode,
+                s.widget_theme,
+                s.progress_color_mode,
+                s.edge_collapse,
+                s.edge_expanded,
+                s.detail_visible,
             ),
             None => return,
         }
@@ -1179,37 +1524,62 @@ fn render_layered() {
 
     let hwnd = hwnd_val.to_hwnd();
 
-    // For non-embedded fallback, just invalidate and let WM_PAINT handle it
-    if !embedded {
-        unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
-        }
-        return;
-    }
-
     let width = total_widget_width();
-    let height = sc(WIDGET_HEIGHT);
-
+    let main_width = total_widget_width_for(active_model_count(show_claude_code, show_codex));
+    let height = current_widget_height();
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
-    let track = if is_dark {
+    let effective_dark = if placement_mode == PlacementMode::Floating {
+        widget_theme == WidgetTheme::Dark
+    } else {
+        is_dark
+    };
+    let track = if placement_mode == PlacementMode::Floating {
+        if effective_dark {
+            Color::from_hex("#303640")
+        } else {
+            Color::from_hex("#CDD3DB")
+        }
+    } else if is_dark {
         Color::from_hex("#444444")
     } else {
         Color::from_hex("#AAAAAA")
     };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
+    let text_color = if effective_dark {
+        if placement_mode == PlacementMode::Floating {
+            Color::from_hex("#C8D0DA")
+        } else {
+            Color::from_hex("#888888")
+        }
     } else {
         Color::from_hex("#404040")
     };
-    let bg_color = if is_dark {
+    let accent = if placement_mode == PlacementMode::Floating && effective_dark {
+        Color::from_hex("#FFB28A")
+    } else {
+        accent
+    };
+    let codex_accent = if placement_mode == PlacementMode::Floating && effective_dark {
+        Color::from_hex("#EAF2FF")
+    } else if placement_mode == PlacementMode::Floating {
+        Color::from_hex("#172033")
+    } else {
+        codex_accent
+    };
+    let bg_color = if placement_mode == PlacementMode::Floating {
+        if widget_theme == WidgetTheme::Dark {
+            Color::from_hex("#11151B")
+        } else {
+            Color::from_hex("#FFFFFF")
+        }
+    } else if is_dark {
         Color::from_hex("#1C1C1C")
     } else {
         Color::from_hex("#F3F3F3")
     };
 
     unsafe {
-        let screen_dc = GetDC(hwnd);
+        let screen_dc = GetDC(HWND::default());
 
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -1231,20 +1601,29 @@ fn render_layered() {
 
         if dib.is_invalid() || bits.is_null() {
             let _ = DeleteDC(mem_dc);
-            ReleaseDC(hwnd, screen_dc);
+            ReleaseDC(HWND::default(), screen_dc);
             return;
         }
 
         let old_bmp = SelectObject(mem_dc, dib);
         let pixel_count = (width * height) as usize;
+        let clear_brush = CreateSolidBrush(COLORREF(FLOATING_TRANSPARENT_KEY));
+        let clear_rect = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        FillRect(mem_dc, &clear_rect, clear_brush);
+        let _ = DeleteObject(clear_brush);
 
         // Render once with the actual taskbar background colour.
         // Using an opaque background lets us use CLEARTYPE_QUALITY for
         // sub-pixel font rendering that matches the rest of the OS.
         paint_content(
             mem_dc,
-            width,
-            height,
+            main_width,
+            main_widget_height_for_placement(placement_mode),
             is_dark,
             &bg_color,
             &text_color,
@@ -1261,16 +1640,32 @@ fn render_layered() {
             &codex_weekly_text,
             show_claude_code,
             show_codex,
+            placement_mode,
+            progress_color_mode,
+            if edge_expanded {
+                EdgeCollapse::None
+            } else {
+                edge_collapse
+            },
             &codex_accent,
         );
 
-        // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
+        if detail_visible && placement_mode == PlacementMode::Floating {
+            paint_detail_panel(mem_dc, width, height);
+        }
+
+        // Fixed mode: taskbar background pixels → alpha 1 (nearly invisible but hittable).
+        // Floating mode: transparent-key pixels outside the rounded card → alpha 0.
         // Content pixels → fully opaque (preserves ClearType sub-pixel rendering).
         let bg_bgr = bg_color.to_colorref();
         let pixel_data = std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count);
         for px in pixel_data.iter_mut() {
             let rgb = *px & 0x00FFFFFF;
-            if rgb == bg_bgr {
+            if (placement_mode == PlacementMode::Floating || detail_visible)
+                && rgb == FLOATING_TRANSPARENT_KEY
+            {
+                *px = 0x00000000;
+            } else if placement_mode == PlacementMode::Fixed && rgb == bg_bgr {
                 *px = 0x01000000;
             } else {
                 *px = rgb | 0xFF000000;
@@ -1306,7 +1701,7 @@ fn render_layered() {
         SelectObject(mem_dc, old_bmp);
         let _ = DeleteObject(dib);
         let _ = DeleteDC(mem_dc);
-        ReleaseDC(hwnd, screen_dc);
+        ReleaseDC(HWND::default(), screen_dc);
     }
 }
 
@@ -1314,7 +1709,7 @@ fn render_layered() {
 fn paint_content(
     hdc: HDC,
     width: i32,
-    height: i32,
+    main_height: i32,
     is_dark: bool,
     bg: &Color,
     text_color: &Color,
@@ -1331,6 +1726,9 @@ fn paint_content(
     codex_weekly_text: &str,
     show_claude_code: bool,
     show_codex: bool,
+    placement_mode: PlacementMode,
+    progress_color_mode: ProgressColorMode,
+    edge_collapse: EdgeCollapse,
     codex_accent: &Color,
 ) {
     unsafe {
@@ -1338,56 +1736,121 @@ fn paint_content(
             left: 0,
             top: 0,
             right: width,
-            bottom: height,
+            bottom: main_height,
         };
 
-        let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
-        FillRect(hdc, &client_rect, bg_brush);
-        let _ = DeleteObject(bg_brush);
+        if placement_mode == PlacementMode::Floating {
+            let clear_brush = CreateSolidBrush(COLORREF(native_interop::colorref(255, 0, 255)));
+            FillRect(hdc, &client_rect, clear_brush);
+            let _ = DeleteObject(clear_brush);
 
-        // Left divider
-        let divider_h = sc(25);
-        let divider_top = (height - divider_h) / 2;
-        let divider_bottom = divider_top + divider_h;
+            let card_rect = RECT {
+                left: sc(3),
+                top: sc(3),
+                right: width - sc(3),
+                bottom: main_height - sc(3),
+            };
+            if bg.r >= 100 {
+                let shadow_rect = RECT {
+                    left: sc(2),
+                    top: sc(3),
+                    right: width - sc(2),
+                    bottom: main_height - sc(2),
+                };
+                draw_rounded_frame(
+                    hdc,
+                    &shadow_rect,
+                    &Color::from_hex("#D1D5DB"),
+                    sc(FLOATING_CORNER_RADIUS + 2),
+                );
+            }
+            draw_rounded_rect(hdc, &card_rect, bg, sc(FLOATING_CORNER_RADIUS));
 
-        let (div_left, div_right) = if is_dark {
-            ((80, 80, 80), (40, 40, 40))
+            let border = if bg.r < 100 {
+                Color::from_hex("#353C47")
+            } else {
+                Color::from_hex("#F4F5F7")
+            };
+            draw_rounded_frame(hdc, &card_rect, &border, sc(FLOATING_CORNER_RADIUS));
         } else {
-            ((160, 160, 160), (230, 230, 230))
-        };
+            let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
+            FillRect(hdc, &client_rect, bg_brush);
+            let _ = DeleteObject(bg_brush);
+        }
 
-        let left_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_left.0, div_left.1, div_left.2,
-        )));
-        let left_rect = RECT {
-            left: 0,
-            top: divider_top,
-            right: sc(2),
-            bottom: divider_bottom,
-        };
-        FillRect(hdc, &left_rect, left_brush);
-        let _ = DeleteObject(left_brush);
+        if placement_mode == PlacementMode::Fixed {
+            // Left divider
+            let divider_h = sc(25);
+            let divider_top = (main_height - divider_h) / 2;
+            let divider_bottom = divider_top + divider_h;
 
-        let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_right.0,
-            div_right.1,
-            div_right.2,
-        )));
-        let right_rect = RECT {
-            left: sc(2),
-            top: divider_top,
-            right: sc(3),
-            bottom: divider_bottom,
-        };
-        FillRect(hdc, &right_rect, right_brush);
-        let _ = DeleteObject(right_brush);
+            let (div_left, div_right) = if is_dark {
+                ((80, 80, 80), (40, 40, 40))
+            } else {
+                ((160, 160, 160), (230, 230, 230))
+            };
 
-        let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
+            let left_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
+                div_left.0, div_left.1, div_left.2,
+            )));
+            let left_rect = RECT {
+                left: 0,
+                top: divider_top,
+                right: sc(2),
+                bottom: divider_bottom,
+            };
+            FillRect(hdc, &left_rect, left_brush);
+            let _ = DeleteObject(left_brush);
+
+            let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
+                div_right.0,
+                div_right.1,
+                div_right.2,
+            )));
+            let right_rect = RECT {
+                left: sc(2),
+                top: divider_top,
+                right: sc(3),
+                bottom: divider_bottom,
+            };
+            FillRect(hdc, &right_rect, right_brush);
+            let _ = DeleteObject(right_brush);
+        }
+
+        let content_x = if placement_mode == PlacementMode::Floating {
+            sc(12)
+        } else {
+            sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN)
+        };
+        let row2_y = if placement_mode == PlacementMode::Floating {
+            main_height - sc(10) - sc(SEGMENT_H)
+        } else {
+            main_height - sc(5) - sc(SEGMENT_H)
+        };
+        let row1_y = if placement_mode == PlacementMode::Floating {
+            row2_y - sc(12) - sc(SEGMENT_H)
+        } else {
+            row2_y - sc(10) - sc(SEGMENT_H)
+        };
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+
+        if placement_mode == PlacementMode::Floating && edge_collapse != EdgeCollapse::None {
+            draw_collapsed_floating_content(
+                hdc,
+                width,
+                main_height,
+                edge_collapse,
+                text_color,
+                codex_session_pct,
+                codex_session_text,
+                codex_weekly_pct,
+                codex_weekly_text,
+                progress_color_mode,
+            );
+            return;
+        }
 
         let font_name = native_interop::wide_str("Segoe UI");
         let font = CreateFontW(
@@ -1424,6 +1887,7 @@ fn paint_content(
             accent,
             codex_accent,
             track,
+            progress_color_mode,
         );
         draw_row(
             hdc,
@@ -1441,6 +1905,7 @@ fn paint_content(
             accent,
             codex_accent,
             track,
+            progress_color_mode,
         );
 
         SelectObject(hdc, old_font);
@@ -1448,64 +1913,352 @@ fn paint_content(
     }
 }
 
-fn do_poll(send_hwnd: SendHwnd) {
-    let hwnd = send_hwnd.to_hwnd();
-    let (show_claude_code, show_codex) = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| (s.show_claude_code, s.show_codex))
-            .unwrap_or((true, false))
-    };
+fn draw_collapsed_floating_content(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    edge_collapse: EdgeCollapse,
+    text_color: &Color,
+    codex_session_pct: f64,
+    codex_session_text: &str,
+    codex_weekly_pct: f64,
+    codex_weekly_text: &str,
+    progress_color_mode: ProgressColorMode,
+) {
+    unsafe {
+        let font_name = native_interop::wide_str("Segoe UI");
+        let font = CreateFontW(
+            sc(-12),
+            0,
+            0,
+            0,
+            FW_SEMIBOLD.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(hdc, font);
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
-    match poller::poll(show_claude_code, show_codex) {
-        Ok(data) => {
-            let mut state = lock_state();
-            if let Some(s) = state.as_mut() {
-                if let Some(claude_code) = data.claude_code.as_ref() {
-                    s.session_percent = claude_code.session.percentage;
-                    s.weekly_percent = claude_code.weekly.percentage;
-                } else if s.show_claude_code {
-                    s.session_percent = 0.0;
-                    s.weekly_percent = 0.0;
+        let lines = [
+            collapsed_usage_parts(codex_session_pct, codex_session_text),
+            collapsed_usage_parts(codex_weekly_pct, codex_weekly_text),
+        ];
+        let row_h = sc(19);
+        let top = (height - row_h * 2) / 2;
+        for (idx, (pct_text, countdown)) in lines.iter().enumerate() {
+            let visible_w = sc(FLOATING_COLLAPSED_VISIBLE_WIDTH);
+            let left = if edge_collapse == EdgeCollapse::Left {
+                width - visible_w
+            } else {
+                0
+            };
+            let row_top = top + idx as i32 * row_h;
+            let pct_color = progress_fill_color(
+                if idx == 0 {
+                    codex_session_pct
+                } else {
+                    codex_weekly_pct
                 }
-                if let Some(codex) = data.codex.as_ref() {
-                    s.codex_session_percent = codex.session.percentage;
-                    s.codex_weekly_percent = codex.weekly.percentage;
-                } else if s.show_codex {
-                    s.codex_session_percent = 0.0;
-                    s.codex_weekly_percent = 0.0;
-                }
-                // Stop fast-poll if reset data is now fresh
-                if !poller::app_is_past_reset(&data) {
-                    unsafe {
-                        let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                    }
-                }
+                .clamp(0.0, 100.0),
+                text_color,
+                progress_color_mode,
+            );
+            let mut pct_wide = native_interop::wide_str(pct_text);
+            let pct_rect = RECT {
+                left: left + sc(13),
+                top: row_top,
+                right: left + sc(47),
+                bottom: row_top + row_h,
+            };
+            let _ = SetTextColor(hdc, COLORREF(pct_color.to_colorref()));
+            let _ = DrawTextW(
+                hdc,
+                &mut pct_wide,
+                &pct_rect as *const RECT as *mut RECT,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
 
-                s.data = Some(data);
-                s.last_poll_ok = true;
-                refresh_usage_texts(s);
+            let mut countdown_wide = native_interop::wide_str(countdown);
+            let countdown_rect = RECT {
+                left: left + sc(47),
+                top: top + idx as i32 * row_h,
+                right: left + visible_w - sc(3),
+                bottom: top + (idx as i32 + 1) * row_h,
+            };
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+            let _ = DrawTextW(
+                hdc,
+                &mut countdown_wide,
+                &countdown_rect as *const RECT as *mut RECT,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
 
-                // Recovered from errors — restore normal poll interval
-                if s.retry_count > 0 {
-                    s.retry_count = 0;
-                    let interval = s.poll_interval_ms;
-                    unsafe {
-                        SetTimer(hwnd, TIMER_POLL, interval, None);
-                    }
-                }
-                s.force_notify_auth_error = false;
-                s.auth_error_paused_polling = false;
-                s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
-                s.auth_watch_snapshot.clear();
-            }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+    }
+}
 
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+fn collapsed_usage_parts(percent: f64, text: &str) -> (String, String) {
+    let countdown = text
+        .split('\u{00b7}')
+        .nth(1)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(compact_countdown_text)
+        .unwrap_or_else(|| "--".to_string());
+    (format!("{:.0}%", percent), countdown)
+}
+
+fn compact_countdown_text(text: &str) -> String {
+    let token = text.split_whitespace().next().unwrap_or(text).trim();
+    if token.eq_ignore_ascii_case("now") {
+        return "1m".to_string();
+    }
+    if token.ends_with('d') || token.ends_with('h') || token.ends_with('m') {
+        return token.to_string();
+    }
+    if let Some(raw_secs) = token.strip_suffix('s').and_then(|v| v.parse::<u64>().ok()) {
+        let minutes = raw_secs.div_ceil(60).max(1);
+        return format!("{minutes}m");
+    }
+    token.to_string()
+}
+
+fn work_area_rect() -> RECT {
+    unsafe {
+        let mut rect = RECT::default();
+        if SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut rect as *mut RECT as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+        {
+            rect
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
             }
         }
+    }
+}
+
+fn full_floating_widget_width_for_state(state: &AppState) -> i32 {
+    total_widget_width_for_state(state)
+}
+
+fn collapsed_floating_x(edge: EdgeCollapse, work: &RECT, width: i32) -> i32 {
+    match edge {
+        EdgeCollapse::Left => work.left - width + sc(FLOATING_COLLAPSED_VISIBLE_WIDTH),
+        EdgeCollapse::Right => work.right - sc(FLOATING_COLLAPSED_VISIBLE_WIDTH) - sc(1),
+        EdgeCollapse::None => work.left,
+    }
+}
+
+fn clamp_floating_position(
+    desired_x: i32,
+    desired_y: i32,
+    width: i32,
+    height: i32,
+    work: &RECT,
+) -> (i32, i32) {
+    let margin = sc(FLOATING_EDGE_MARGIN);
+    let min_x = work.left + margin;
+    let max_x = (work.right - width - margin).max(min_x);
+    let min_y = work.top + margin;
+    let max_y = (work.bottom - height - margin).max(min_y);
+    (desired_x.clamp(min_x, max_x), desired_y.clamp(min_y, max_y))
+}
+
+fn floating_edge_for_position(desired_x: i32, width: i32, work: &RECT) -> EdgeCollapse {
+    let snap = sc(FLOATING_EDGE_SNAP_DISTANCE);
+    if desired_x <= work.left + snap {
+        EdgeCollapse::Left
+    } else if desired_x + width >= work.right - snap {
+        EdgeCollapse::Right
+    } else {
+        EdgeCollapse::None
+    }
+}
+
+fn track_mouse_leave(hwnd: HWND) {
+    unsafe {
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        let _ = TrackMouseEvent(&mut track);
+    }
+}
+
+fn expanded_floating_x(edge: EdgeCollapse, work: &RECT, width: i32) -> i32 {
+    match edge {
+        EdgeCollapse::Left => work.left + sc(1),
+        EdgeCollapse::Right => work.right - width - sc(1),
+        EdgeCollapse::None => work.left + sc(FLOATING_EDGE_MARGIN),
+    }
+}
+
+fn edge_target_rect(edge: EdgeCollapse, expanded: bool) -> Option<(i32, i32, i32, i32)> {
+    if edge == EdgeCollapse::None {
+        return None;
+    }
+    let work = work_area_rect();
+    let state = lock_state();
+    let s = state.as_ref()?;
+    let width = full_floating_widget_width_for_state(s);
+    let height = widget_height_for_state(s);
+    let x = if expanded {
+        expanded_floating_x(edge, &work, width)
+    } else {
+        collapsed_floating_x(edge, &work, width)
+    };
+    let y = s
+        .floating_y
+        .unwrap_or(work.top + sc(FLOATING_EDGE_MARGIN))
+        .clamp(
+            work.top + sc(FLOATING_EDGE_MARGIN),
+            (work.bottom - height - sc(FLOATING_EDGE_MARGIN))
+                .max(work.top + sc(FLOATING_EDGE_MARGIN)),
+        );
+    Some((x, y, width, height))
+}
+
+fn start_edge_animation(hwnd: HWND, edge: EdgeCollapse, expanded: bool) {
+    if edge == EdgeCollapse::None {
+        return;
+    }
+    let Some((to_x, y, _to_width, height)) = edge_target_rect(edge, expanded) else {
+        return;
+    };
+    let mut from_x = to_x;
+    if let Some(rect) = native_interop::get_window_rect_safe(hwnd) {
+        from_x = rect.left;
+    }
+
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.edge_expanded = expanded;
+            s.floating_x = Some(to_x);
+            s.floating_y = Some(y);
+            s.edge_animation = Some(EdgeAnimation {
+                from_x,
+                to_x,
+                y,
+                height,
+                start: Instant::now(),
+                duration: Duration::from_millis(180),
+            });
+        }
+    }
+    unsafe {
+        SetTimer(hwnd, TIMER_EDGE_ANIMATION, 15, None);
+    }
+}
+
+fn tick_edge_animation(hwnd: HWND) {
+    let (x, y, width, height, finished) = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        let Some(animation) = s.edge_animation else {
+            unsafe {
+                let _ = KillTimer(hwnd, TIMER_EDGE_ANIMATION);
+            }
+            return;
+        };
+        let elapsed = animation.start.elapsed().as_secs_f64();
+        let duration = animation.duration.as_secs_f64().max(0.001);
+        let t = (elapsed / duration).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t).powi(4);
+        let lerp_i32 = |from: i32, to: i32| from + ((to - from) as f64 * eased).round() as i32;
+        let finished = t >= 1.0;
+        let x = lerp_i32(animation.from_x, animation.to_x);
+        let width = full_floating_widget_width_for_state(s);
+        if finished {
+            s.edge_animation = None;
+            s.floating_x = Some(animation.to_x);
+            s.floating_y = Some(animation.y);
+        }
+        (x, animation.y, width, animation.height, finished)
+    };
+
+    native_interop::move_window(hwnd, x, y, width, height);
+    if finished {
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_EDGE_ANIMATION);
+        }
+        render_layered();
+    }
+}
+
+fn do_poll(send_hwnd: SendHwnd) {
+    let hwnd = send_hwnd.to_hwnd();
+    let (show_claude_code, show_codex, usage_mode, sub2api_config) = {
+        let state = lock_state();
+        let (show_claude_code, show_codex) = state
+            .as_ref()
+            .map(|s| (s.show_claude_code, s.show_codex))
+            .unwrap_or((false, true));
+        let settings = load_settings();
+        (
+            show_claude_code,
+            show_codex,
+            settings.usage_mode,
+            settings.sub2api,
+        )
+    };
+
+    if show_codex && usage_mode == poller::UsageMode::Sub2api {
+        match poller::poll_sub2api_codex_quick(&sub2api_config) {
+            Ok(codex) => {
+                diagnose::log("quick usage poll succeeded");
+                apply_codex_quick_poll_success(hwnd, codex.clone());
+                match poller::poll_sub2api_codex_usage_for_details(&sub2api_config, &codex) {
+                    Ok(detailed_codex) => {
+                        diagnose::log("usage detail poll succeeded");
+                        apply_codex_poll_success(hwnd, detailed_codex);
+                    }
+                    Err(e) => {
+                        diagnose::log(format!("usage detail poll failed: {e:?}"));
+                    }
+                }
+                return;
+            }
+            Err(e) => {
+                diagnose::log(format!("quick usage poll failed: {e:?}"));
+            }
+        }
+    }
+
+    match poller::poll_with_mode(
+        show_claude_code,
+        show_codex,
+        usage_mode,
+        Some(&sub2api_config),
+    ) {
+        Ok(data) => {
+            diagnose::log("usage poll succeeded");
+            apply_poll_success(hwnd, data);
+        }
         Err(e) => {
+            diagnose::log(format!("usage poll failed: {e:?}"));
             let auth_watch = match e {
                 poller::PollError::AuthRequired | poller::PollError::TokenExpired => Some((
                     poller::CredentialWatchMode::ActiveSource,
@@ -1603,6 +2356,141 @@ fn do_poll(send_hwnd: SendHwnd) {
     }
 }
 
+fn apply_codex_quick_poll_success(hwnd: HWND, mut codex: UsageData) {
+    let previous_details = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .and_then(|s| s.data.as_ref())
+            .and_then(|data| data.codex.as_ref())
+            .map(|codex| codex.account_details.clone())
+            .unwrap_or_default()
+    };
+    preserve_account_detail_stats(&mut codex.account_details, &previous_details);
+    apply_codex_poll_success(hwnd, codex);
+}
+
+fn preserve_account_detail_stats(
+    new_details: &mut [AccountUsageDetail],
+    previous_details: &[AccountUsageDetail],
+) {
+    for detail in new_details.iter_mut() {
+        if let Some(previous) = previous_details
+            .iter()
+            .find(|previous| previous.id == detail.id)
+        {
+            detail.session_requests = previous.session_requests;
+            detail.session_tokens = previous.session_tokens;
+            detail.session_cost = previous.session_cost;
+            detail.weekly_requests = previous.weekly_requests;
+            detail.weekly_tokens = previous.weekly_tokens;
+            detail.weekly_cost = previous.weekly_cost;
+        }
+    }
+}
+
+fn apply_codex_poll_success(hwnd: HWND, codex: UsageData) {
+    let mut data = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .and_then(|s| s.data.clone())
+            .unwrap_or_default()
+    };
+    data.codex = Some(codex);
+    apply_poll_success(hwnd, data);
+}
+
+fn apply_poll_success(hwnd: HWND, data: AppUsageData) {
+    let mut state = lock_state();
+    if let Some(s) = state.as_mut() {
+        if let Some(claude_code) = data.claude_code.as_ref() {
+            s.session_percent = claude_code.session.percentage;
+            s.weekly_percent = claude_code.weekly.percentage;
+        } else if s.show_claude_code {
+            s.session_percent = 0.0;
+            s.weekly_percent = 0.0;
+        }
+        if let Some(codex) = data.codex.as_ref() {
+            s.codex_session_percent = codex.session.percentage;
+            s.codex_weekly_percent = codex.weekly.percentage;
+        } else if s.show_codex {
+            s.codex_session_percent = 0.0;
+            s.codex_weekly_percent = 0.0;
+        }
+        // Stop fast-poll if reset data is now fresh
+        if !poller::app_is_past_reset(&data) {
+            unsafe {
+                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+            }
+        }
+
+        s.data = Some(data);
+        s.last_poll_ok = true;
+        refresh_usage_texts(s);
+
+        // Recovered from errors — restore normal poll interval
+        if s.retry_count > 0 {
+            s.retry_count = 0;
+            let interval = s.poll_interval_ms;
+            unsafe {
+                SetTimer(hwnd, TIMER_POLL, interval, None);
+            }
+        }
+        s.force_notify_auth_error = false;
+        s.auth_error_paused_polling = false;
+        s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
+        s.auth_watch_snapshot.clear();
+    }
+    drop(state);
+    save_state_settings();
+
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+    }
+}
+
+fn refresh_sub2api_groups(send_hwnd: SendHwnd) {
+    let should_start = {
+        let mut state = lock_state();
+        match state.as_mut() {
+            Some(s) if !s.sub2api_groups_loading => {
+                s.sub2api_groups_loading = true;
+                true
+            }
+            _ => false,
+        }
+    };
+    if !should_start {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let hwnd = send_hwnd.to_hwnd();
+        let config = load_settings().sub2api;
+        let result = poller::fetch_sub2api_groups(&config);
+        {
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.sub2api_groups_loading = false;
+                match result {
+                    Ok(groups) => {
+                        diagnose::log(format!("Sub2API group list refreshed: {}", groups.len()));
+                        s.sub2api_groups = groups;
+                        s.sub2api_groups_loaded = true;
+                    }
+                    Err(error) => {
+                        diagnose::log(format!("Sub2API group list refresh failed: {error:?}"));
+                    }
+                }
+            }
+        }
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_APP_SUB2API_GROUPS_UPDATED, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
 fn schedule_countdown_timer() {
     let state = lock_state();
     let s = match state.as_ref() {
@@ -1677,6 +2565,52 @@ fn check_theme_change() {
     }
 }
 
+fn refresh_widget_layout() {
+    position_at_taskbar();
+    render_layered();
+}
+
+fn refresh_widget_theme_and_layout() {
+    refresh_widget_layout();
+}
+
+fn resize_widget_at_current_position(hwnd: HWND) {
+    let (width, height, placement_mode) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return;
+        };
+        (
+            total_widget_width_for_state(s),
+            widget_height_for_state(s),
+            s.placement_mode,
+        )
+    };
+
+    if placement_mode != PlacementMode::Floating {
+        position_at_taskbar();
+        return;
+    }
+
+    let rect = native_interop::get_window_rect_safe(hwnd);
+    let work = work_area_rect();
+    let (x, y) = if let Some(rect) = rect {
+        (
+            rect.left.clamp(
+                work.left + sc(4),
+                (work.right - width - sc(4)).max(work.left + sc(4)),
+            ),
+            rect.top.clamp(
+                work.top + sc(4),
+                (work.bottom - height - sc(4)).max(work.top + sc(4)),
+            ),
+        )
+    } else {
+        (work.right - width - sc(18), work.top + sc(18))
+    };
+    native_interop::move_window(hwnd, x, y, width, height);
+}
+
 fn check_language_change() {
     if update_language_change() {
         render_layered();
@@ -1725,7 +2659,19 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, taskbar_hwnd) = {
+    let (
+        hwnd,
+        was_embedded,
+        tray_offset,
+        taskbar_hwnd,
+        placement_mode,
+        floating_x,
+        floating_y,
+        edge_collapse,
+        edge_expanded,
+        detail_visible,
+        detail_rows,
+    ) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -1745,7 +2691,19 @@ fn position_at_taskbar() {
             }
         };
 
-        (s.hwnd.to_hwnd(), s.embedded, s.tray_offset, taskbar_hwnd)
+        (
+            s.hwnd.to_hwnd(),
+            s.embedded,
+            s.tray_offset,
+            taskbar_hwnd,
+            s.placement_mode,
+            s.floating_x,
+            s.floating_y,
+            s.edge_collapse,
+            s.edge_expanded,
+            s.detail_visible,
+            detail_row_count_for_state(s),
+        )
     };
 
     let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
@@ -1758,6 +2716,7 @@ fn position_at_taskbar() {
 
     let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
     let mut tray_left = taskbar_rect.right;
+    let mut task_buttons_right = taskbar_rect.left;
     let anchor_top = taskbar_rect.top;
     let anchor_height = taskbar_height;
 
@@ -1766,25 +2725,82 @@ fn position_at_taskbar() {
             tray_left = tray_rect.left;
         }
     }
+    if let Some(tasks_hwnd) =
+        native_interop::find_descendant_window(taskbar_hwnd, "MSTaskListWClass")
+    {
+        if let Some(tasks_rect) = native_interop::get_window_rect_safe(tasks_hwnd) {
+            task_buttons_right = tasks_rect.right;
+        }
+    }
 
     let widget_width = total_widget_width();
+    let widget_height = current_widget_height();
+    let requested_x = tray_left - widget_width - tray_offset;
+    diagnose::log(format!(
+        "widget placement mode={placement_mode:?} tray_left={tray_left} task_buttons_right={task_buttons_right} requested_x={requested_x} widget_width={widget_width}"
+    ));
 
-    let widget_height = sc(WIDGET_HEIGHT);
-    let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-    if embedded {
+    if placement_mode == PlacementMode::Floating {
+        if was_embedded {
+            native_interop::float_as_topmost(hwnd);
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.embedded = false;
+            }
+        }
+
+        let work = work_area_rect();
+        let default_x = (tray_left - widget_width).max(work.left + sc(FLOATING_EDGE_MARGIN));
+        let default_y =
+            (taskbar_rect.top - widget_height - sc(10)).max(work.top + sc(FLOATING_EDGE_MARGIN));
+        let (mut x, y) = clamp_floating_position(
+            floating_x.unwrap_or(default_x),
+            floating_y.unwrap_or(default_y),
+            widget_width,
+            widget_height,
+            &work,
+        );
+        if edge_collapse != EdgeCollapse::None {
+            x = if edge_expanded {
+                expanded_floating_x(edge_collapse, &work, widget_width)
+            } else {
+                collapsed_floating_x(edge_collapse, &work, widget_width)
+            };
+        }
+        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+        diagnose::log(format!(
+            "positioned floating widget at x={x} y={y} w={widget_width} h={widget_height}"
+        ));
+    } else if detail_visible && placement_mode == PlacementMode::Floating {
+        if was_embedded {
+            native_interop::float_as_topmost(hwnd);
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.embedded = false;
+            }
+        }
+
+        let y = taskbar_rect.top - detail_panel_height_for_rows(detail_rows);
+        native_interop::move_window(hwnd, requested_x, y, widget_width, widget_height);
+        diagnose::log(format!(
+            "positioned fixed detail widget at x={requested_x} y={y} w={widget_width} h={widget_height}"
+        ));
+    } else {
+        if !was_embedded {
+            native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.embedded = true;
+            }
+        }
+
+        let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
         // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
+        let x = requested_x - taskbar_rect.left;
         native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
         diagnose::log(format!(
             "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
             y - taskbar_rect.top
-        ));
-    } else {
-        // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
         ));
     }
 }
@@ -1947,6 +2963,16 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
+                TIMER_EDGE_ANIMATION => {
+                    tick_edge_animation(hwnd);
+                }
+                TIMER_DETAIL_OUTSIDE => {
+                    close_detail_if_clicked_outside();
+                }
+                TIMER_DETAIL_RENDER => {
+                    let _ = KillTimer(hwnd, TIMER_DETAIL_RENDER);
+                    render_layered();
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -1954,31 +2980,49 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
             check_language_change();
-            render_layered();
+            refresh_widget_theme_and_layout();
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
                 TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS,
             ));
             sync_tray_icons(hwnd);
+            invalidate_detail_window();
             LRESULT(0)
         }
         WM_APP_UPDATE_CHECK_COMPLETE => {
             schedule_auto_update_check(hwnd);
             LRESULT(0)
         }
+        WM_APP_SUB2API_GROUPS_UPDATED => LRESULT(0),
         WM_SETCURSOR => {
-            let is_dragging = {
+            let (is_dragging, placement_mode) = {
                 let state = lock_state();
-                state.as_ref().map(|s| s.dragging).unwrap_or(false)
+                state
+                    .as_ref()
+                    .map(|s| (s.dragging, s.placement_mode))
+                    .unwrap_or((false, PlacementMode::Fixed))
             };
             // Always show resize cursor while dragging or when hovering divider zone
             let hit_test = (lparam.0 & 0xFFFF) as u16;
             if is_dragging {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
+                let cursor = LoadCursorW(
+                    HINSTANCE::default(),
+                    if placement_mode == PlacementMode::Floating {
+                        IDC_SIZEALL
+                    } else {
+                        IDC_SIZEWE
+                    },
+                )
+                .unwrap_or_default();
                 SetCursor(cursor);
                 return LRESULT(1);
             }
             if hit_test == 1 {
+                if placement_mode == PlacementMode::Floating {
+                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default();
+                    SetCursor(cursor);
+                    return LRESULT(1);
+                }
                 // HTCLIENT
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
@@ -1993,27 +3037,76 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
-            if client_x < sc(DIVIDER_HIT_ZONE) {
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                let mut state = lock_state();
-                if let Some(s) = state.as_mut() {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                if s.placement_mode == PlacementMode::Floating || client_x < sc(DIVIDER_HIT_ZONE) {
                     s.dragging = true;
                     s.drag_start_mouse_x = pt.x;
+                    s.drag_start_mouse_y = pt.y;
                     s.drag_start_offset = s.tray_offset;
+                    s.drag_start_floating_x = s.floating_x.unwrap_or(pt.x);
+                    s.drag_start_floating_y = s.floating_y.unwrap_or(pt.y);
+                    if s.placement_mode == PlacementMode::Floating {
+                        if let Some(rect) = native_interop::get_window_rect_safe(hwnd) {
+                            s.drag_start_floating_x = rect.left;
+                            s.drag_start_floating_y = rect.top;
+                        }
+                        if s.edge_collapse != EdgeCollapse::None {
+                            let work = work_area_rect();
+                            let full_width = full_floating_widget_width_for_state(s);
+                            s.drag_start_floating_x = match s.edge_collapse {
+                                EdgeCollapse::Left => work.left + sc(FLOATING_EDGE_MARGIN),
+                                EdgeCollapse::Right => {
+                                    work.right - full_width - sc(FLOATING_EDGE_MARGIN)
+                                }
+                                EdgeCollapse::None => s.drag_start_floating_x,
+                            };
+                        }
+                    }
+                    SetCapture(hwnd);
                 }
-                SetCapture(hwnd);
             }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let is_dragging = {
+            let (is_dragging, should_expand, should_redraw_detail_hover) = {
                 let state = lock_state();
-                state.as_ref().map(|s| s.dragging).unwrap_or(false)
+                state
+                    .as_ref()
+                    .map(|s| {
+                        (
+                            s.dragging,
+                            s.placement_mode == PlacementMode::Floating
+                                && s.edge_collapse != EdgeCollapse::None
+                                && !s.edge_expanded
+                                && !s.dragging
+                                && !s.detail_visible,
+                            s.detail_visible && !s.dragging,
+                        )
+                    })
+                    .unwrap_or((false, false, false))
             };
+            if should_expand {
+                let edge = {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        if !s.mouse_tracking {
+                            track_mouse_leave(hwnd);
+                            s.mouse_tracking = true;
+                        }
+                        s.edge_collapse
+                    } else {
+                        EdgeCollapse::None
+                    }
+                };
+                start_edge_animation(hwnd, edge, true);
+            }
             if is_dragging {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
+                let mut needs_render = false;
                 let move_target = {
                     let mut state = lock_state();
                     let s = match state.as_mut() {
@@ -2021,69 +3114,131 @@ unsafe extern "system" fn wnd_proc(
                         None => return LRESULT(0),
                     };
 
-                    // Moving mouse left = positive delta = larger offset (further left)
-                    let delta = s.drag_start_mouse_x - pt.x;
-                    let mut new_offset = s.drag_start_offset + delta;
+                    if s.placement_mode == PlacementMode::Floating {
+                        let hwnd_val = s.hwnd.to_hwnd();
+                        let full_width = full_floating_widget_width_for_state(s);
+                        let widget_height = widget_height_for_state(s);
+                        let desired_x = s.drag_start_floating_x + (pt.x - s.drag_start_mouse_x);
+                        let desired_y = s.drag_start_floating_y + (pt.y - s.drag_start_mouse_y);
+                        let work = work_area_rect();
+                        let edge = floating_edge_for_position(desired_x, full_width, &work);
+                        let widget_width = full_width;
+                        let (mut new_x, new_y) = clamp_floating_position(
+                            desired_x,
+                            desired_y,
+                            widget_width,
+                            widget_height,
+                            &work,
+                        );
+                        if edge != EdgeCollapse::None {
+                            new_x = expanded_floating_x(edge, &work, widget_width);
+                        }
+                        s.floating_x = Some(new_x);
+                        s.floating_y = Some(new_y);
+                        if s.edge_collapse != edge {
+                            s.edge_collapse = edge;
+                            s.edge_expanded = edge != EdgeCollapse::None;
+                            needs_render = true;
+                        }
+                        Some((
+                            hwnd_val,
+                            false,
+                            new_x,
+                            new_y,
+                            0,
+                            widget_width,
+                            widget_height,
+                        ))
+                    } else {
+                        // Moving mouse left = positive delta = larger offset (further left)
+                        let delta = s.drag_start_mouse_x - pt.x;
+                        let mut new_offset = s.drag_start_offset + delta;
 
-                    // Clamp: offset >= 0 (can't go right of default)
-                    if new_offset < 0 {
-                        new_offset = 0;
-                    }
+                        // Clamp: offset >= 0 (can't go right of default)
+                        if new_offset < 0 {
+                            new_offset = 0;
+                        }
 
-                    let taskbar_hwnd = s.taskbar_hwnd;
-                    let embedded = s.embedded;
-                    let hwnd_val = s.hwnd.to_hwnd();
+                        let taskbar_hwnd = s.taskbar_hwnd;
+                        let embedded = s.embedded;
+                        let hwnd_val = s.hwnd.to_hwnd();
 
-                    // Clamp: don't go past left edge of taskbar
-                    if let Some(taskbar_hwnd) = taskbar_hwnd {
-                        if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                            let mut tray_left = taskbar_rect.right;
-                            if let Some(tray_hwnd) =
-                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
+                        // Clamp: don't go past left edge of taskbar
+                        if let Some(taskbar_hwnd) = taskbar_hwnd {
+                            if let Some(taskbar_rect) =
+                                native_interop::get_taskbar_rect(taskbar_hwnd)
                             {
-                                if let Some(tray_rect) =
-                                    native_interop::get_window_rect_safe(tray_hwnd)
+                                let mut tray_left = taskbar_rect.right;
+                                if let Some(tray_hwnd) =
+                                    native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
                                 {
-                                    tray_left = tray_rect.left;
+                                    if let Some(tray_rect) =
+                                        native_interop::get_window_rect_safe(tray_hwnd)
+                                    {
+                                        tray_left = tray_rect.left;
+                                    }
                                 }
-                            }
-                            let widget_width = total_widget_width_for_state(s);
-                            let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-                            if new_offset > max_offset {
-                                new_offset = max_offset;
-                            }
+                                let mut task_buttons_right = taskbar_rect.left;
+                                if let Some(tasks_hwnd) = native_interop::find_descendant_window(
+                                    taskbar_hwnd,
+                                    "MSTaskListWClass",
+                                ) {
+                                    if let Some(tasks_rect) =
+                                        native_interop::get_window_rect_safe(tasks_hwnd)
+                                    {
+                                        task_buttons_right = tasks_rect.right;
+                                    }
+                                }
 
-                            s.tray_offset = new_offset;
+                                let widget_width = total_widget_width_for_state(s);
+                                let taskbar_gap = sc(6);
+                                let max_offset =
+                                    (tray_left - task_buttons_right - taskbar_gap - widget_width)
+                                        .max(0);
+                                if new_offset > max_offset {
+                                    new_offset = max_offset;
+                                }
 
-                            let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-                            let anchor_top = taskbar_rect.top;
-                            let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT);
-                            let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-                            let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - new_offset
+                                s.tray_offset = new_offset;
+
+                                let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+                                let anchor_top = taskbar_rect.top;
+                                let anchor_height = taskbar_height;
+                                let widget_height = sc(WIDGET_HEIGHT);
+                                let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+                                let x = if embedded {
+                                    tray_left - taskbar_rect.left - widget_width - new_offset
+                                } else {
+                                    tray_left - widget_width - new_offset
+                                };
+                                let y = if embedded {
+                                    y
+                                } else {
+                                    (taskbar_rect.top - widget_height - sc(2)).max(0)
+                                };
+                                Some((
+                                    hwnd_val,
+                                    embedded,
+                                    x,
+                                    y,
+                                    taskbar_rect.top,
+                                    widget_width,
+                                    widget_height,
+                                ))
                             } else {
-                                tray_left - widget_width - new_offset
-                            };
-                            Some((
-                                hwnd_val,
-                                embedded,
-                                x,
-                                y,
-                                taskbar_rect.top,
-                                widget_width,
-                                widget_height,
-                            ))
+                                s.tray_offset = new_offset;
+                                None
+                            }
                         } else {
                             s.tray_offset = new_offset;
                             None
                         }
-                    } else {
-                        s.tray_offset = new_offset;
-                        None
                     }
                 };
 
+                if needs_render {
+                    render_layered();
+                }
                 if let Some((hwnd_val, embedded, x, y, taskbar_top, widget_width, widget_height)) =
                     move_target
                 {
@@ -2099,27 +3254,75 @@ unsafe extern "system" fn wnd_proc(
                         native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
                     }
                 }
+            } else if should_redraw_detail_hover {
+                render_layered();
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE_MSG => {
+            let edge = {
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.mouse_tracking = false;
+                    if s.placement_mode == PlacementMode::Floating
+                        && s.edge_collapse != EdgeCollapse::None
+                        && s.edge_expanded
+                        && !s.dragging
+                        && !s.detail_visible
+                    {
+                        s.edge_collapse
+                    } else {
+                        EdgeCollapse::None
+                    }
+                } else {
+                    EdgeCollapse::None
+                }
+            };
+            if edge != EdgeCollapse::None {
+                start_edge_animation(hwnd, edge, false);
             }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let was_dragging = {
+            let (was_dragging, should_track_leave, should_toggle_detail) = {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
                 let mut state = lock_state();
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
+                        let moved = (pt.x - s.drag_start_mouse_x).abs()
+                            + (pt.y - s.drag_start_mouse_y).abs();
                         s.dragging = false;
                         let offset = s.tray_offset;
-                        Some(offset)
+                        (
+                            Some(offset),
+                            s.placement_mode == PlacementMode::Floating
+                                && s.edge_collapse != EdgeCollapse::None
+                                && s.edge_expanded,
+                            moved <= sc(4),
+                        )
                     } else {
-                        None
+                        (None, false, true)
                     }
                 } else {
-                    None
+                    (None, false, false)
                 }
             };
             if was_dragging.is_some() {
                 let _ = ReleaseCapture();
+                if should_track_leave {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        if !s.mouse_tracking {
+                            track_mouse_leave(hwnd);
+                            s.mouse_tracking = true;
+                        }
+                    }
+                }
                 save_state_settings();
+            }
+            if should_toggle_detail {
+                toggle_detail_window(hwnd);
             }
             LRESULT(0)
         }
@@ -2134,14 +3337,9 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
                             s.force_notify_auth_error = true;
                         }
                     }
-                    render_layered();
                     let sh = SendHwnd::from_hwnd(hwnd);
                     std::thread::spawn(move || {
                         do_poll(sh);
@@ -2194,6 +3392,9 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.tray_offset = 0;
+                            s.floating_x = None;
+                            s.floating_y = None;
+                            s.edge_collapse = EdgeCollapse::None;
                         }
                     }
                     save_state_settings();
@@ -2202,8 +3403,11 @@ unsafe extern "system" fn wnd_proc(
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
                 }
-                IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
+                IDM_FREQ_10SEC | IDM_FREQ_30SEC | IDM_FREQ_1MIN | IDM_FREQ_5MIN
+                | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
+                        IDM_FREQ_10SEC => POLL_10_SEC,
+                        IDM_FREQ_30SEC => POLL_30_SEC,
                         IDM_FREQ_1MIN => POLL_1_MIN,
                         IDM_FREQ_5MIN => POLL_5_MIN,
                         IDM_FREQ_15MIN => POLL_15_MIN,
@@ -2224,19 +3428,8 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            match id {
-                                IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || !s.show_claude_code {
-                                        s.show_claude_code = !s.show_claude_code;
-                                    }
-                                }
-                                IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || !s.show_codex {
-                                        s.show_codex = !s.show_codex;
-                                    }
-                                }
-                                _ => {}
-                            }
+                            s.show_claude_code = false;
+                            s.show_codex = true;
                             s.session_text = "...".to_string();
                             s.weekly_text = "...".to_string();
                             s.codex_session_text = "...".to_string();
@@ -2252,6 +3445,94 @@ unsafe extern "system" fn wnd_proc(
                         do_poll(sh);
                     });
                 }
+                IDM_PLACEMENT_FIXED | IDM_PLACEMENT_FLOATING => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.placement_mode = if id == IDM_PLACEMENT_FLOATING {
+                                PlacementMode::Floating
+                            } else {
+                                PlacementMode::Fixed
+                            };
+                            if s.placement_mode == PlacementMode::Fixed {
+                                s.edge_collapse = EdgeCollapse::None;
+                            }
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
+                IDM_THEME_LIGHT | IDM_THEME_DARK => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.widget_theme = if id == IDM_THEME_LIGHT {
+                                WidgetTheme::Light
+                            } else {
+                                WidgetTheme::Dark
+                            };
+                        }
+                    }
+                    save_state_settings();
+                    refresh_widget_theme_and_layout();
+                }
+                IDM_COLOR_MONO | IDM_COLOR_ANTD => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.progress_color_mode = if id == IDM_COLOR_ANTD {
+                                ProgressColorMode::Antd
+                            } else {
+                                ProgressColorMode::Mono
+                            };
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
+                IDM_GROUP_REFRESH => {
+                    refresh_sub2api_groups(SendHwnd::from_hwnd(hwnd));
+                }
+                IDM_GROUP_BASE..=IDM_GROUP_MAX => {
+                    let idx = (id - IDM_GROUP_BASE) as usize;
+                    let selected = {
+                        let state = lock_state();
+                        state
+                            .as_ref()
+                            .and_then(|s| s.sub2api_groups.get(idx).cloned())
+                    };
+                    if let Some(group) = selected {
+                        let mut settings = load_settings();
+                        settings.sub2api.group_id = Some(group.id);
+                        settings.sub2api.group_name = group.name;
+                        settings.cached_usage = None;
+                        save_settings(&settings);
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.data = None;
+                                s.last_poll_ok = true;
+                                s.session_percent = 0.0;
+                                s.weekly_percent = 0.0;
+                                s.codex_session_percent = 0.0;
+                                s.codex_weekly_percent = 0.0;
+                                s.session_text = "...".to_string();
+                                s.weekly_text = "...".to_string();
+                                s.codex_session_text = "...".to_string();
+                                s.codex_weekly_text = "...".to_string();
+                                s.detail_visible = false;
+                                s.detail_mouse_down_seen = false;
+                            }
+                        }
+                        position_at_taskbar();
+                        render_layered();
+                        let sh = SendHwnd::from_hwnd(hwnd);
+                        std::thread::spawn(move || {
+                            do_poll(sh);
+                        });
+                    }
+                }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
                 | IDM_LANG_DUTCH
@@ -2260,6 +3541,7 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_LANG_GERMAN
                 | IDM_LANG_JAPANESE
                 | IDM_LANG_KOREAN
+                | IDM_LANG_SIMPLIFIED_CHINESE
                 | IDM_LANG_TRADITIONAL_CHINESE
                 | IDM_LANG_RUSSIAN
                 | IDM_LANG_PORTUGUESE_BRAZIL => {
@@ -2272,6 +3554,7 @@ unsafe extern "system" fn wnd_proc(
                         IDM_LANG_GERMAN => Some(LanguageId::German),
                         IDM_LANG_JAPANESE => Some(LanguageId::Japanese),
                         IDM_LANG_KOREAN => Some(LanguageId::Korean),
+                        IDM_LANG_SIMPLIFIED_CHINESE => Some(LanguageId::SimplifiedChinese),
                         IDM_LANG_TRADITIONAL_CHINESE => Some(LanguageId::TraditionalChinese),
                         IDM_LANG_RUSSIAN => Some(LanguageId::Russian),
                         IDM_LANG_PORTUGUESE_BRAZIL => Some(LanguageId::PortugueseBrazil),
@@ -2321,6 +3604,798 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+fn toggle_detail_window(owner: HWND) {
+    let visible = {
+        let state = lock_state();
+        state.as_ref().map(|s| s.detail_visible).unwrap_or(false)
+    };
+    if visible {
+        hide_detail_window();
+    } else {
+        show_detail_panel(owner);
+    }
+}
+
+unsafe extern "system" fn detail_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            paint_detail_layered(hwnd, rect.right - rect.left, rect.bottom - rect.top);
+            let _ = EndPaint(hwnd, &ps);
+            let _ = hdc;
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_LBUTTONUP => {
+            hide_detail_window();
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn hide_detail_window() {
+    let (main_hwnd, detail_hwnd) = {
+        let mut state = lock_state();
+        state
+            .as_mut()
+            .map(|s| {
+                s.detail_visible = false;
+                s.detail_mouse_down_seen = false;
+                (s.hwnd.to_hwnd(), s.detail_hwnd.take().map(|h| h.to_hwnd()))
+            })
+            .unwrap_or((HWND::default(), None))
+    };
+    unsafe {
+        let _ = KillTimer(main_hwnd, TIMER_DETAIL_OUTSIDE);
+        let _ = KillTimer(main_hwnd, TIMER_DETAIL_RENDER);
+        if let Some(hwnd) = detail_hwnd {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+    resize_widget_at_current_position(main_hwnd);
+    render_layered();
+}
+
+fn invalidate_detail_window() {
+    let hwnd = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| {
+            if s.detail_visible {
+                s.detail_hwnd.map(|h| h.to_hwnd())
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(hwnd) = hwnd {
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+}
+
+fn detail_items() -> Vec<AccountUsageDetail> {
+    let state = lock_state();
+    state
+        .as_ref()
+        .and_then(|s| s.data.as_ref())
+        .and_then(|data| data.codex.as_ref())
+        .map(|codex| codex.account_details.clone())
+        .unwrap_or_default()
+}
+
+fn show_detail_panel(owner: HWND) {
+    diagnose::log("detail: show requested");
+    let placement_mode = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.placement_mode)
+            .unwrap_or(PlacementMode::Fixed)
+    };
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.detail_visible = true;
+            s.detail_mouse_down_seen = true;
+            s.edge_collapse = EdgeCollapse::None;
+            s.edge_expanded = false;
+            s.edge_animation = None;
+        }
+    }
+    unsafe {
+        let _ = KillTimer(owner, TIMER_EDGE_ANIMATION);
+        SetTimer(owner, TIMER_DETAIL_OUTSIDE, 80, None);
+        if placement_mode == PlacementMode::Floating {
+            SetTimer(owner, TIMER_DETAIL_RENDER, 30, None);
+        }
+    }
+    if placement_mode == PlacementMode::Fixed {
+        show_fixed_detail_popup(owner);
+        render_layered();
+    } else {
+        resize_widget_at_current_position(owner);
+        render_layered();
+    }
+    diagnose::log(format!(
+        "detail: panel shown items={}",
+        detail_items().len()
+    ));
+}
+
+fn show_fixed_detail_popup(owner: HWND) {
+    let (detail_width, detail_height, detail_rows) = {
+        let state = lock_state();
+        let rows = state.as_ref().map(detail_row_count_for_state).unwrap_or(1);
+        (
+            sc(DETAIL_PANEL_WIDTH),
+            detail_panel_height_for_rows(rows),
+            rows,
+        )
+    };
+    let Some(main_rect) = native_interop::get_window_rect_safe(owner) else {
+        return;
+    };
+    let x = (main_rect.right - detail_width).max(0);
+    let y = (main_rect.top - detail_height - sc(4)).max(0);
+    unsafe {
+        let hwnd = {
+            let mut state = lock_state();
+            if let Some(existing) = state
+                .as_ref()
+                .and_then(|s| s.detail_hwnd.map(|h| h.to_hwnd()))
+            {
+                existing
+            } else {
+                let class_name = native_interop::wide_str("ClaudeCodeUsageDetail");
+                let title = native_interop::wide_str("Codex Usage Detail");
+                let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
+                let created = CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                    PCWSTR::from_raw(class_name.as_ptr()),
+                    PCWSTR::from_raw(title.as_ptr()),
+                    WS_POPUP,
+                    x,
+                    y,
+                    detail_width,
+                    detail_height,
+                    HWND::default(),
+                    HMENU::default(),
+                    hinstance,
+                    None,
+                )
+                .unwrap();
+                if let Some(s) = state.as_mut() {
+                    s.detail_hwnd = Some(SendHwnd::from_hwnd(created));
+                }
+                created
+            }
+        };
+        native_interop::move_window(hwnd, x, y, detail_width, detail_height);
+        paint_detail_layered(hwnd, detail_width, detail_height);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    diagnose::log(format!(
+        "fixed detail popup shown rows={detail_rows} x={x} y={y} w={detail_width} h={detail_height}"
+    ));
+}
+
+fn point_in_window(hwnd: HWND, pt: POINT) -> bool {
+    native_interop::get_window_rect_safe(hwnd)
+        .map(|rect| {
+            pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom
+        })
+        .unwrap_or(false)
+}
+
+fn close_detail_if_clicked_outside() {
+    let left_down = unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+    let right_down = unsafe { (GetAsyncKeyState(VK_RBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+    if !left_down && !right_down {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            if s.detail_visible {
+                s.detail_mouse_down_seen = false;
+            }
+        }
+        return;
+    }
+
+    let (main_hwnd, detail_hwnd, visible, already_seen_down) = {
+        let mut state = lock_state();
+        state
+            .as_mut()
+            .map(|s| {
+                let already_seen = s.detail_mouse_down_seen;
+                s.detail_mouse_down_seen = true;
+                (
+                    s.hwnd.to_hwnd(),
+                    s.detail_hwnd.map(|h| h.to_hwnd()),
+                    s.detail_visible,
+                    already_seen,
+                )
+            })
+            .unwrap_or((HWND::default(), None, false, true))
+    };
+    if !visible || already_seen_down {
+        return;
+    }
+
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let in_main = point_in_window(main_hwnd, pt);
+    let in_detail = detail_hwnd
+        .map(|hwnd| point_in_window(hwnd, pt))
+        .unwrap_or(false);
+    if !in_main && !in_detail {
+        hide_detail_window();
+    }
+}
+
+fn paint_detail_layered(hwnd: HWND, width: i32, height: i32) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    unsafe {
+        let screen_dc = GetDC(HWND::default());
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        let dib =
+            CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+        if dib.is_invalid() || bits.is_null() {
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(HWND::default(), screen_dc);
+            return;
+        }
+        let old_bmp = SelectObject(mem_dc, dib);
+        let clear_brush = CreateSolidBrush(COLORREF(FLOATING_TRANSPARENT_KEY));
+        let clear_rect = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        FillRect(mem_dc, &clear_rect, clear_brush);
+        let _ = DeleteObject(clear_brush);
+
+        paint_detail_panel(mem_dc, width, height);
+
+        let pixel_count = (width * height) as usize;
+        let pixel_data = std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count);
+        for px in pixel_data.iter_mut() {
+            let rgb = *px & 0x00FFFFFF;
+            if rgb == FLOATING_TRANSPARENT_KEY {
+                *px = 0x00000000;
+            } else {
+                *px = rgb | 0xFF000000;
+            }
+        }
+
+        let pt_src = POINT { x: 0, y: 0 };
+        let sz = SIZE {
+            cx: width,
+            cy: height,
+        };
+        let blend = BLENDFUNCTION {
+            BlendOp: 0,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: 1,
+        };
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            screen_dc,
+            None,
+            Some(&sz),
+            mem_dc,
+            Some(&pt_src),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+
+        SelectObject(mem_dc, old_bmp);
+        let _ = DeleteObject(dib);
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(HWND::default(), screen_dc);
+    }
+}
+
+fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
+    let (items, is_dark, placement_mode, widget_theme, progress_color_mode, strings, hwnd) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return;
+        };
+        (
+            s.data
+                .as_ref()
+                .and_then(|data| data.codex.as_ref())
+                .map(|codex| codex.account_details.clone())
+                .unwrap_or_default(),
+            s.is_dark,
+            s.placement_mode,
+            s.widget_theme,
+            s.progress_color_mode,
+            s.language.strings(),
+            s.hwnd.to_hwnd(),
+        )
+    };
+    let effective_dark = widget_theme == WidgetTheme::Dark;
+    let bg = if effective_dark {
+        Color::from_hex("#11151B")
+    } else {
+        Color::from_hex("#FFFFFF")
+    };
+    let border = if effective_dark {
+        Color::from_hex("#2D3542")
+    } else {
+        Color::from_hex("#E4E8EF")
+    };
+    let muted = if effective_dark {
+        Color::from_hex("#9AA6B5")
+    } else {
+        Color::from_hex("#667085")
+    };
+    let row_bg = bg;
+    let text = if effective_dark {
+        Color::from_hex("#E7EDF5")
+    } else {
+        Color::from_hex("#263142")
+    };
+    let track = if effective_dark {
+        Color::from_hex("#303640")
+    } else {
+        Color::from_hex("#D7DDE6")
+    };
+    let accent = if effective_dark {
+        Color::from_hex("#EAF2FF")
+    } else {
+        Color::from_hex("#172033")
+    };
+
+    unsafe {
+        if width <= 0 || height <= 0 {
+            return;
+        }
+
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let font_name = native_interop::wide_str("Segoe UI");
+        let text_font = CreateFontW(
+            sc(-12),
+            0,
+            0,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(hdc, text_font);
+        let top = if placement_mode == PlacementMode::Fixed {
+            sc(2)
+        } else {
+            sc(FLOATING_WIDGET_HEIGHT) + sc(2)
+        };
+        let hover_pt = detail_hover_point(hwnd);
+        if items.is_empty() {
+            let rect = RECT {
+                left: sc(8),
+                top,
+                right: width - sc(8),
+                bottom: height - sc(8),
+            };
+            draw_rounded_rect(hdc, &rect, &bg, sc(7));
+            draw_rounded_frame(hdc, &rect, &border, sc(7));
+            let mut label_wide = native_interop::wide_str("暂无账号数据");
+            let _ = SetTextColor(hdc, COLORREF(muted.to_colorref()));
+            let mut text_rect = RECT {
+                left: rect.left + sc(12),
+                top: rect.top,
+                right: rect.right - sc(12),
+                bottom: rect.bottom,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut label_wide,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        } else {
+            for (idx, item) in items.iter().take(DETAIL_PANEL_MAX_ROWS).enumerate() {
+                let y = top + idx as i32 * sc(DETAIL_ROW_HEIGHT);
+                draw_compact_detail_row(
+                    hdc,
+                    item,
+                    sc(8),
+                    y,
+                    width - sc(16),
+                    sc(DETAIL_ROW_HEIGHT - 6),
+                    is_dark,
+                    strings,
+                    &row_bg,
+                    &border,
+                    &text,
+                    &muted,
+                    &track,
+                    &accent,
+                    progress_color_mode,
+                    hover_pt,
+                );
+            }
+        }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(text_font);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_compact_detail_row(
+    hdc: HDC,
+    item: &AccountUsageDetail,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    _is_dark: bool,
+    strings: Strings,
+    row_bg: &Color,
+    border: &Color,
+    text: &Color,
+    muted: &Color,
+    track: &Color,
+    accent: &Color,
+    progress_color_mode: ProgressColorMode,
+    hover_pt: Option<POINT>,
+) {
+    unsafe {
+        let row_rect = RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
+        };
+        draw_rounded_rect(hdc, &row_rect, row_bg, sc(7));
+        draw_rounded_frame(hdc, &row_rect, border, sc(7));
+
+        let name = shorten_account_name(&item.name, item.id);
+        let mut name_wide = native_interop::wide_str(&name);
+        let mut name_rect = RECT {
+            left: x + sc(10),
+            top: y + sc(7),
+            right: x + width - sc(12),
+            bottom: y + sc(26),
+        };
+        let _ = SetTextColor(hdc, COLORREF(text.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut name_wide,
+            &mut name_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+
+        draw_compact_usage_line(
+            hdc,
+            x + sc(12),
+            y + sc(36),
+            "5h",
+            item.session_requests,
+            item.session_tokens,
+            item.session_cost,
+            &item.session,
+            strings,
+            text,
+            muted,
+            track,
+            accent,
+            progress_color_mode,
+            hover_pt,
+        );
+        draw_compact_usage_line(
+            hdc,
+            x + sc(12),
+            y + sc(78),
+            "7d",
+            item.weekly_requests,
+            item.weekly_tokens,
+            item.weekly_cost,
+            &item.weekly,
+            strings,
+            text,
+            muted,
+            track,
+            accent,
+            progress_color_mode,
+            hover_pt,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_compact_usage_line(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    label: &str,
+    requests: u64,
+    tokens: u64,
+    cost: f64,
+    section: &UsageSection,
+    strings: Strings,
+    text: &Color,
+    muted: &Color,
+    track: &Color,
+    accent: &Color,
+    progress_color_mode: ProgressColorMode,
+    hover_pt: Option<POINT>,
+) {
+    unsafe {
+        let mut label_wide = native_interop::wide_str(label);
+        let mut label_rect = RECT {
+            left: x,
+            top: y + sc(18),
+            right: x + sc(24),
+            bottom: y + sc(33),
+        };
+        let _ = SetTextColor(hdc, COLORREF(muted.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut label_wide,
+            &mut label_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let bar_x = x + sc(27);
+        let segment_count = SEGMENT_COUNT;
+        let seg_w = sc(SEGMENT_W);
+        let seg_h = sc(12);
+        let seg_gap = sc(SEGMENT_GAP);
+        let stats_bg = if track.r < 80 {
+            Color::from_hex("#202734")
+        } else {
+            Color::from_hex("#EEF1F5")
+        };
+        let stats = detail_stat_values(requests, tokens, cost);
+        let pill_widths = [
+            detail_pill_width(&stats[0], 46, 70),
+            detail_pill_width(&stats[1], 44, 76),
+            detail_pill_width(&stats[2], 48, 80),
+        ];
+        let pill_gap = sc(4);
+        let pill_h = sc(18);
+        let pill_y = y;
+        let mut pill_x = bar_x;
+        let stat_labels = ["请求数", "Token数", "统计额度"];
+        let mut tooltip: Option<(RECT, &str)> = None;
+        for (idx, value) in stats.iter().enumerate() {
+            let pill_rect = RECT {
+                left: pill_x,
+                top: pill_y,
+                right: pill_x + pill_widths[idx],
+                bottom: pill_y + pill_h,
+            };
+            draw_rounded_rect(hdc, &pill_rect, &stats_bg, sc(8));
+            let is_hovered = hover_pt
+                .map(|pt| point_in_rect(pt, &pill_rect))
+                .unwrap_or(false);
+            if is_hovered {
+                tooltip = Some((pill_rect, stat_labels[idx]));
+            }
+            let mut stats_wide = native_interop::wide_str(value);
+            let mut stats_rect = RECT {
+                left: pill_rect.left + sc(4),
+                top: pill_rect.top,
+                right: pill_rect.right - sc(4),
+                bottom: pill_rect.bottom,
+            };
+            let _ = SetTextColor(hdc, COLORREF(muted.to_colorref()));
+            let _ = DrawTextW(
+                hdc,
+                &mut stats_wide,
+                &mut stats_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+            pill_x += pill_widths[idx] + pill_gap;
+        }
+        if let Some((pill_rect, tip)) = tooltip {
+            draw_detail_tip(hdc, &pill_rect, tip, text);
+        }
+
+        let fill = progress_fill_color(
+            section.percentage.clamp(0.0, 100.0),
+            accent,
+            progress_color_mode,
+        );
+        let percent = section.percentage.clamp(0.0, 100.0);
+        let segment_percent = 100.0 / segment_count as f64;
+        for i in 0..segment_count {
+            let seg_x = bar_x + i * (seg_w + seg_gap);
+            let seg_start = i as f64 * segment_percent;
+            let seg_end = seg_start + segment_percent;
+            let rect = RECT {
+                left: seg_x,
+                top: y + sc(21),
+                right: seg_x + seg_w,
+                bottom: y + sc(21) + seg_h,
+            };
+            if percent >= seg_end {
+                draw_rounded_rect(hdc, &rect, &fill, sc(2));
+            } else if percent <= seg_start {
+                draw_rounded_rect(hdc, &rect, track, sc(2));
+            } else {
+                draw_rounded_rect(hdc, &rect, track, sc(2));
+                let fraction = (percent - seg_start) / segment_percent;
+                let fill_width = (seg_w as f64 * fraction) as i32;
+                if fill_width > 0 {
+                    let fill_rect = RECT {
+                        left: seg_x,
+                        top: y + sc(21),
+                        right: seg_x + fill_width,
+                        bottom: y + sc(21) + seg_h,
+                    };
+                    let rgn = CreateRoundRectRgn(
+                        rect.left,
+                        rect.top,
+                        rect.right + 1,
+                        rect.bottom + 1,
+                        sc(4),
+                        sc(4),
+                    );
+                    let _ = SelectClipRgn(hdc, rgn);
+                    let brush = CreateSolidBrush(COLORREF(fill.to_colorref()));
+                    FillRect(hdc, &fill_rect, brush);
+                    let _ = DeleteObject(brush);
+                    let _ = SelectClipRgn(hdc, HRGN::default());
+                    let _ = DeleteObject(rgn);
+                }
+            }
+        }
+
+        let line = poller::format_line(section, strings);
+        let mut line_wide = native_interop::wide_str(&line);
+        let mut line_rect = RECT {
+            left: bar_x + segment_count * (seg_w + seg_gap) + sc(5),
+            top: y + sc(20),
+            right: x + sc(272),
+            bottom: y + sc(36),
+        };
+        let _ = SetTextColor(hdc, COLORREF(text.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut line_wide,
+            &mut line_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
+}
+
+fn detail_hover_point(hwnd: HWND) -> Option<POINT> {
+    unsafe {
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return None;
+        }
+        let _ = ScreenToClient(hwnd, &mut pt);
+        Some(pt)
+    }
+}
+
+fn point_in_rect(pt: POINT, rect: &RECT) -> bool {
+    pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom
+}
+
+fn detail_pill_width(value: &str, min_width: i32, max_width: i32) -> i32 {
+    let mut rough = 14;
+    for ch in value.chars() {
+        rough += match ch {
+            '0'..='9' => 7,
+            '.' | ',' => 4,
+            '$' => 7,
+            ' ' => 4,
+            'K' | 'M' | 'B' | 'r' | 'A' | 'U' => 8,
+            'a'..='z' => 6,
+            _ => 7,
+        };
+    }
+    sc(rough.clamp(min_width, max_width))
+}
+
+fn draw_detail_tip(hdc: HDC, anchor: &RECT, text: &str, text_color: &Color) {
+    unsafe {
+        let tip_w = match text {
+            "统计额度" => sc(66),
+            "Token数" => sc(56),
+            _ => sc(50),
+        };
+        let tip_h = sc(18);
+        let center = (anchor.left + anchor.right) / 2;
+        let mut tip_rect = RECT {
+            left: center - tip_w / 2,
+            top: anchor.top - tip_h - sc(4),
+            right: center + tip_w / 2,
+            bottom: anchor.top - sc(4),
+        };
+        if tip_rect.top < sc(2) {
+            tip_rect.top = anchor.bottom + sc(4);
+            tip_rect.bottom = tip_rect.top + tip_h;
+        }
+        draw_rounded_rect(hdc, &tip_rect, &Color::from_hex("#F2F4F7"), sc(6));
+        draw_rounded_frame(hdc, &tip_rect, &Color::from_hex("#E2E6EC"), sc(6));
+        let mut wide = native_interop::wide_str(text);
+        let mut text_rect = RECT {
+            left: tip_rect.left + sc(5),
+            top: tip_rect.top,
+            right: tip_rect.right - sc(5),
+            bottom: tip_rect.bottom,
+        };
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut text_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
+}
+
+fn detail_stat_values(requests: u64, tokens: u64, cost: f64) -> [String; 3] {
+    [
+        format!("{} req", compact_number(requests)),
+        format!("U {}", compact_number(tokens)),
+        format!("A ${:.1}", cost.max(0.0)),
+    ]
+}
+
+fn compact_number(value: u64) -> String {
+    if value >= 1_000_000_000 {
+        format!("{:.1}B", value as f64 / 1_000_000_000.0)
+    } else if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn shorten_account_name(name: &str, id: i64) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        format!("#{id}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn show_context_menu(hwnd: HWND) {
     unsafe {
         let (
@@ -2333,8 +4408,16 @@ fn show_context_menu(hwnd: HWND) {
             widget_visible,
             show_claude_code,
             show_codex,
+            placement_mode,
+            widget_theme,
+            progress_color_mode,
+            sub2api_groups,
+            sub2api_groups_loading,
+            current_group_id,
+            usage_mode,
         ) = {
             let state = lock_state();
+            let settings = load_settings();
             match state.as_ref() {
                 Some(s) => (
                     s.poll_interval_ms,
@@ -2346,6 +4429,13 @@ fn show_context_menu(hwnd: HWND) {
                     s.widget_visible,
                     s.show_claude_code,
                     s.show_codex,
+                    s.placement_mode,
+                    s.widget_theme,
+                    s.progress_color_mode,
+                    s.sub2api_groups.clone(),
+                    s.sub2api_groups_loading,
+                    settings.sub2api.group_id,
+                    settings.usage_mode,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2357,6 +4447,13 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     true,
                     false,
+                    PlacementMode::Fixed,
+                    WidgetTheme::Dark,
+                    ProgressColorMode::Mono,
+                    Vec::new(),
+                    false,
+                    None,
+                    poller::UsageMode::Codex,
                 ),
             }
         };
@@ -2373,7 +4470,11 @@ fn show_context_menu(hwnd: HWND) {
 
         // Update Frequency submenu
         let freq_menu = CreatePopupMenu().unwrap();
-        let freq_items: [(u16, u32, &str); 4] = [
+        let ten_seconds = format!("10{}", strings.second_suffix);
+        let thirty_seconds = format!("30{}", strings.second_suffix);
+        let freq_items: [(u16, u32, &str); 6] = [
+            (IDM_FREQ_10SEC, POLL_10_SEC, ten_seconds.as_str()),
+            (IDM_FREQ_30SEC, POLL_30_SEC, thirty_seconds.as_str()),
             (IDM_FREQ_1MIN, POLL_1_MIN, strings.one_minute),
             (IDM_FREQ_5MIN, POLL_5_MIN, strings.five_minutes),
             (IDM_FREQ_15MIN, POLL_15_MIN, strings.fifteen_minutes),
@@ -2404,21 +4505,9 @@ fn show_context_menu(hwnd: HWND) {
 
         // Models submenu
         let models_menu = CreatePopupMenu().unwrap();
-        let claude_model = native_interop::wide_str(strings.claude_code_model);
-        let claude_flags = if show_claude_code {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            claude_flags,
-            IDM_MODEL_CLAUDE_CODE as usize,
-            PCWSTR::from_raw(claude_model.as_ptr()),
-        );
 
         let codex_model = native_interop::wide_str(strings.codex_model);
-        let codex_flags = if show_codex {
+        let codex_flags = if show_codex && !show_claude_code {
             MF_CHECKED
         } else {
             MENU_ITEM_FLAGS(0)
@@ -2436,6 +4525,160 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             models_menu.0 as usize,
             PCWSTR::from_raw(models_label.as_ptr()),
+        );
+
+        if usage_mode == poller::UsageMode::Sub2api {
+            let groups_menu = CreatePopupMenu().unwrap();
+            if sub2api_groups.is_empty() {
+                let label = if sub2api_groups_loading {
+                    "加载分组中..."
+                } else {
+                    "刷新分组"
+                };
+                let label = native_interop::wide_str(label);
+                let _ = AppendMenuW(
+                    groups_menu,
+                    if sub2api_groups_loading {
+                        MF_GRAYED
+                    } else {
+                        MENU_ITEM_FLAGS(0)
+                    },
+                    IDM_GROUP_REFRESH as usize,
+                    PCWSTR::from_raw(label.as_ptr()),
+                );
+            } else {
+                for (idx, group) in sub2api_groups
+                    .iter()
+                    .take((IDM_GROUP_MAX - IDM_GROUP_BASE + 1) as usize)
+                    .enumerate()
+                {
+                    let label = native_interop::wide_str(&group.name);
+                    let flags = if Some(group.id) == current_group_id {
+                        MF_CHECKED
+                    } else {
+                        MENU_ITEM_FLAGS(0)
+                    };
+                    let _ = AppendMenuW(
+                        groups_menu,
+                        flags,
+                        (IDM_GROUP_BASE + idx as u16) as usize,
+                        PCWSTR::from_raw(label.as_ptr()),
+                    );
+                }
+                let _ = AppendMenuW(groups_menu, MF_SEPARATOR, 0, PCWSTR::null());
+                let refresh_label = native_interop::wide_str("刷新分组");
+                let _ = AppendMenuW(
+                    groups_menu,
+                    if sub2api_groups_loading {
+                        MF_GRAYED
+                    } else {
+                        MENU_ITEM_FLAGS(0)
+                    },
+                    IDM_GROUP_REFRESH as usize,
+                    PCWSTR::from_raw(refresh_label.as_ptr()),
+                );
+            }
+
+            let groups_label = native_interop::wide_str("分组");
+            let _ = AppendMenuW(
+                menu,
+                MF_POPUP,
+                groups_menu.0 as usize,
+                PCWSTR::from_raw(groups_label.as_ptr()),
+            );
+        }
+
+        let placement_menu = CreatePopupMenu().unwrap();
+        let fixed_label = native_interop::wide_str("固定");
+        let floating_label = native_interop::wide_str("浮动");
+        let _ = AppendMenuW(
+            placement_menu,
+            if placement_mode == PlacementMode::Fixed {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_PLACEMENT_FIXED as usize,
+            PCWSTR::from_raw(fixed_label.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            placement_menu,
+            if placement_mode == PlacementMode::Floating {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_PLACEMENT_FLOATING as usize,
+            PCWSTR::from_raw(floating_label.as_ptr()),
+        );
+        let placement_label = native_interop::wide_str("位置");
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            placement_menu.0 as usize,
+            PCWSTR::from_raw(placement_label.as_ptr()),
+        );
+
+        let theme_menu = CreatePopupMenu().unwrap();
+        let light_label = native_interop::wide_str("亮色");
+        let dark_label = native_interop::wide_str("暗色");
+        let _ = AppendMenuW(
+            theme_menu,
+            if widget_theme == WidgetTheme::Light {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_THEME_LIGHT as usize,
+            PCWSTR::from_raw(light_label.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            theme_menu,
+            if widget_theme == WidgetTheme::Dark {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_THEME_DARK as usize,
+            PCWSTR::from_raw(dark_label.as_ptr()),
+        );
+        let theme_label = native_interop::wide_str("主题");
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            theme_menu.0 as usize,
+            PCWSTR::from_raw(theme_label.as_ptr()),
+        );
+
+        let color_menu = CreatePopupMenu().unwrap();
+        let mono_label = native_interop::wide_str("黑白");
+        let antd_label = native_interop::wide_str("彩色");
+        let _ = AppendMenuW(
+            color_menu,
+            if progress_color_mode == ProgressColorMode::Mono {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_COLOR_MONO as usize,
+            PCWSTR::from_raw(mono_label.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            color_menu,
+            if progress_color_mode == ProgressColorMode::Antd {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_COLOR_ANTD as usize,
+            PCWSTR::from_raw(antd_label.as_ptr()),
+        );
+        let color_label = native_interop::wide_str("颜色");
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            color_menu.0 as usize,
+            PCWSTR::from_raw(color_label.as_ptr()),
         );
 
         // Settings submenu
@@ -2485,6 +4728,7 @@ fn show_context_menu(hwnd: HWND) {
                 LanguageId::German => IDM_LANG_GERMAN,
                 LanguageId::Japanese => IDM_LANG_JAPANESE,
                 LanguageId::Korean => IDM_LANG_KOREAN,
+                LanguageId::SimplifiedChinese => IDM_LANG_SIMPLIFIED_CHINESE,
                 LanguageId::TraditionalChinese => IDM_LANG_TRADITIONAL_CHINESE,
                 LanguageId::Russian => IDM_LANG_RUSSIAN,
                 LanguageId::PortugueseBrazil => IDM_LANG_PORTUGUESE_BRAZIL,
@@ -2585,6 +4829,11 @@ fn paint(hdc: HDC, hwnd: HWND) {
         codex_weekly_text,
         show_claude_code,
         show_codex,
+        placement_mode,
+        widget_theme,
+        progress_color_mode,
+        edge_collapse,
+        edge_expanded,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -2601,6 +4850,11 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.codex_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
+                s.placement_mode,
+                s.widget_theme,
+                s.progress_color_mode,
+                s.edge_collapse,
+                s.edge_expanded,
             ),
             None => return,
         }
@@ -2613,12 +4867,27 @@ fn paint(hdc: HDC, hwnd: HWND) {
     } else {
         Color::from_hex("#AAAAAA")
     };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
+    let effective_dark = if placement_mode == PlacementMode::Floating {
+        widget_theme == WidgetTheme::Dark
+    } else {
+        is_dark
+    };
+    let text_color = if effective_dark {
+        if placement_mode == PlacementMode::Floating {
+            Color::from_hex("#C8D0DA")
+        } else {
+            Color::from_hex("#888888")
+        }
     } else {
         Color::from_hex("#404040")
     };
-    let bg_color = if is_dark {
+    let bg_color = if placement_mode == PlacementMode::Floating {
+        if widget_theme == WidgetTheme::Dark {
+            Color::from_hex("#15171C")
+        } else {
+            Color::from_hex("#FFFFFF")
+        }
+    } else if is_dark {
         Color::from_hex("#1C1C1C")
     } else {
         Color::from_hex("#F3F3F3")
@@ -2658,6 +4927,13 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &codex_weekly_text,
             show_claude_code,
             show_codex,
+            placement_mode,
+            progress_color_mode,
+            if edge_expanded {
+                EdgeCollapse::None
+            } else {
+                edge_collapse
+            },
             &codex_accent,
         );
 
@@ -2685,6 +4961,7 @@ fn draw_row(
     claude_accent: &Color,
     codex_accent: &Color,
     track: &Color,
+    progress_color_mode: ProgressColorMode,
 ) {
     let seg_h = sc(SEGMENT_H);
     let active_models = active_model_count(show_claude_code, show_codex);
@@ -2729,6 +5006,7 @@ fn draw_row(
                 claude_accent,
                 track,
                 &claude_value_color,
+                progress_color_mode,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -2743,6 +5021,7 @@ fn draw_row(
                 codex_accent,
                 track,
                 &codex_value_color,
+                progress_color_mode,
             );
         }
     }
@@ -2764,6 +5043,7 @@ fn draw_usage_bar(
     accent: &Color,
     track: &Color,
     text_color: &Color,
+    progress_color_mode: ProgressColorMode,
 ) {
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
@@ -2772,6 +5052,7 @@ fn draw_usage_bar(
 
     unsafe {
         let percent_clamped = percent.clamp(0.0, 100.0);
+        let fill_color = progress_fill_color(percent_clamped, accent, progress_color_mode);
         let segment_percent = 100.0 / segment_count as f64;
 
         for i in 0..segment_count {
@@ -2787,7 +5068,7 @@ fn draw_usage_bar(
             };
 
             if percent_clamped >= seg_end {
-                draw_rounded_rect(hdc, &seg_rect, accent, corner_r);
+                draw_rounded_rect(hdc, &seg_rect, &fill_color, corner_r);
             } else if percent_clamped <= seg_start {
                 draw_rounded_rect(hdc, &seg_rect, track, corner_r);
             } else {
@@ -2810,7 +5091,7 @@ fn draw_usage_bar(
                         corner_r * 2,
                     );
                     let _ = SelectClipRgn(hdc, rgn);
-                    let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
+                    let brush = CreateSolidBrush(COLORREF(fill_color.to_colorref()));
                     FillRect(hdc, &fill_rect, brush);
                     let _ = DeleteObject(brush);
                     let _ = SelectClipRgn(hdc, HRGN::default());
@@ -2837,6 +5118,15 @@ fn draw_usage_bar(
     }
 }
 
+fn progress_fill_color(percent: f64, fallback: &Color, mode: ProgressColorMode) -> Color {
+    match mode {
+        ProgressColorMode::Mono => *fallback,
+        ProgressColorMode::Antd if percent < 50.0 => Color::from_hex("#389E0D"),
+        ProgressColorMode::Antd if percent < 80.0 => Color::from_hex("#D48806"),
+        ProgressColorMode::Antd => Color::from_hex("#CF1322"),
+    }
+}
+
 fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
     unsafe {
         let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
@@ -2851,5 +5141,26 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+fn draw_rounded_frame(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, sc(1), COLORREF(color.to_colorref()));
+        let old_pen = SelectObject(hdc, pen);
+        let brush = GetStockObject(NULL_BRUSH);
+        let old_brush = SelectObject(hdc, brush);
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius * 2,
+            radius * 2,
+        );
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen);
     }
 }

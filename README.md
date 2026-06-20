@@ -1,169 +1,162 @@
+# Sub2API Codex Usage Monitor
+
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
+![Rust](https://img.shields.io/badge/language-Rust-orange)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-# Claude Code Usage Monitor
+A lightweight Windows taskbar widget for monitoring Codex usage, with native support for fetching usage through Sub2API.
 
-![Screenshot](.github/animation.gif)
+This fork keeps the original native Windows widget idea, and extends it for Sub2API-backed Codex usage display, group switching, floating/fixed placement, and richer account detail views.
 
-A lightweight Windows taskbar widget for people already using Claude Code, with optional Codex usage display.
+## Fork Source
 
-It sits in your taskbar and shows how much of your Claude Code and/or Codex usage window you have left, without needing to open the terminal or the provider site.
+This repository is a forked and modified derivative of:
 
-## What You Get
+- [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)
 
-- A **5h** bar for your current 5-hour Claude usage window
-- A **7d** bar for your current 7-day window
-- Optional Codex usage bars alongside Claude Code
-- A live countdown until each limit resets
-- A small native widget that lives directly in the Windows taskbar
-- System tray icon badges showing your enabled model usage percentage
-- Left-click the tray icon to toggle the taskbar widget on or off
-- Right-click options for refresh, displayed models, update frequency, language, startup, and updates
+The original project focused on Claude Code usage with optional Codex support. This fork is adapted for Sub2API-driven Codex usage monitoring on Windows.
 
-## Who This Is For
+## What This Fork Adds
 
-This app is for Windows users who already have **Claude Code (CLI or App) installed and signed in**.
+- Sub2API-backed Codex usage mode
+- Group-based account switching from the right-click menu
+- Average usage aggregation across accounts in a selected group
+- Reset time display based on the nearest relevant account reset
+- Account detail popup with per-account 5h / 7d usage
+- Fixed and floating widget placement modes
+- Light and dark widget themes
+- Simplified Chinese UI support
 
-Codex support is optional. To show Codex usage, install and sign in to the Codex CLI, then enable Codex from the right-click **Models** menu.
+## Main Features
 
-It works best if you want a simple "how close am I to the limit?" display that is always visible.
+- Native Windows taskbar widget
+- 5h and 7d usage bars
+- Countdown to reset
+- System tray icon badges
+- Right-click refresh, placement, theme, color mode, group switching, update frequency, startup, language, and exit
+- Optional floating mode with draggable placement
 
 ## Requirements
 
 - Windows 10 or Windows 11
-- Claude Code (CLI or App) installed and authenticated
-- Optional: Codex CLI installed and authenticated, if you want Codex usage
+- Rust only if you want to build from source
+- A working Sub2API instance if you want to use Sub2API mode
+- Optional: Codex local auth if you also use direct Codex mode
 
-If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
+## Configuration
 
-## Install
-
-Install the latest version from WinGet:
-
-```powershell
-winget install CodeZeno.ClaudeCodeUsageMonitor
-```
-
-If you prefer not to use WinGet, you can still download the latest `claude-code-usage-monitor.exe` from the [Releases](https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases) page and run it directly.
-
-## Use
-
-After installing with WinGet, run:
-
-```powershell
-claude-code-usage-monitor
-```
-
-Once running, it will appear in your taskbar and as one or more tray icons in the notification area.
-
-- Drag the left divider to move the taskbar widget
-- Right-click the taskbar widget or tray icon for refresh, displayed models, update frequency, Start with Windows, reset position, language, updates, and exit
-- Left-click the tray icon to toggle the taskbar widget on or off
-- Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
-
-### Models
-
-Use the right-click **Models** menu to choose what the widget displays:
-
-- **Claude Code** is enabled by default
-- **Codex** can be enabled alongside Claude Code or shown by itself
-
-When both models are shown, each model has its own usage bar and matching usage text color.
-
-### System Tray Icon
-
-The tray icon shows your current 5-hour usage as a percentage badge.
-
-If both Claude Code and Codex are enabled, the app shows two tray icons: one for Claude Code and one for Codex. If only one model is enabled, it shows one tray icon.
-
-The Claude Code tray icon uses the same warm usage colors as the Claude bar. The Codex tray icon uses a black and white badge style.
-
-Hovering over a tray icon shows the usage values for that model.
-
-## Diagnostics
-
-If you need to troubleshoot startup or visibility issues, run:
-
-```powershell
-claude-code-usage-monitor --diagnose
-```
-
-This writes a log file to:
-
-```text
-%TEMP%\claude-code-usage-monitor.log
-```
-
-Settings are saved to:
+Settings are stored in:
 
 ```text
 %APPDATA%\ClaudeCodeUsageMonitor\settings.json
 ```
 
-## Account Support
+Sub2API mode uses fields like:
 
-This app works with the same account types that Claude Code itself supports.
-
-As of **March 19, 2026**, Anthropic's Claude Code setup documentation says:
-
-- **Supported:** Pro, Max, Teams, Enterprise, and Console accounts
-- **Not supported:** the free Claude.ai plan
-
-If Anthropic changes Claude Code availability in the future, this app should follow whatever Claude Code supports, as long as the usage data remains exposed through the same authenticated endpoints.
-
-## Privacy And Security
-
-This project is **open source**, so you can inspect exactly what it does.
-
-What the app reads:
-
-- Your local Claude Code OAuth credentials from `~/.claude/.credentials.json`
-- If needed, the same credentials file inside an installed WSL distro
-- If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
-
-What the app sends over the network:
-
-- Requests to Anthropic's Claude endpoints to read your usage and rate-limit information
-- Requests to ChatGPT's Codex usage endpoint to read your Codex usage and rate-limit information, if Codex is enabled
-- Requests to GitHub only if you use the app's update check / self-update feature
-- If proxy environment variables such as `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` are set, those outbound requests may use that proxy
-
-What the app stores locally:
-
-- Widget position
-- Polling frequency
-- Language preference
-- Last update check time
-- Displayed model preferences
-
-What it does **not** do:
-
-- It does not send your credentials to any other server
-- It does not use a separate backend service
-- It does not collect analytics or telemetry
-- It does not upload your project files
-- It does not directly edit your Codex credentials file
+```json
+{
+  "usage_mode": "sub2api",
+  "sub2api": {
+    "base_url": "https://your-sub2api-host",
+    "admin_api_key": "YOUR_ADMIN_KEY",
+    "group_id": 123,
+    "group_name": "openai-plus",
+    "platform": "openai",
+    "account_type": "oauth",
+    "force_active_usage": true
+  }
+}
+```
 
 Notes:
 
-- If your Claude Code token is expired, the app may ask the local Claude CLI to refresh it in the background
-- If your Codex token is expired, the app may ask the local Codex CLI to refresh it in the background. The monitor does not write `auth.json` itself; any credential update is handled by the Codex CLI.
-- Portable installs can update themselves by downloading the latest release from this repository
-- Proxies should be trusted because proxied usage requests include your OAuth bearer token inside the TLS connection
+- `group_id` can be filled automatically after switching groups in the widget menu.
+- Do not commit real API keys, tokens, or local settings files.
+- Do not hardcode production secrets in source files.
 
-## How It Works
+## Build From Source
 
-The monitor:
+This is a pure Rust Windows application.
 
-1. Finds your enabled model login credentials
-2. Reads your current usage from Anthropic and/or ChatGPT
-3. Shows the result directly in the Windows taskbar
-4. Refreshes periodically in the background
+Standard command:
 
-If the newer usage endpoint is unavailable, it can fall back to reading the rate-limit headers returned by Claude's Messages API.
+```powershell
+cargo build --release
+```
 
-## Open Source
+On this development machine, the default Rust environment may be broken, so the working build flow is:
 
-This project is licensed under MIT.
+```powershell
+$env:RUSTUP_HOME='D:\ai\rust\rustup'
+$env:CARGO_HOME='D:\ai\rust\cargo'
+cargo +stable-x86_64-pc-windows-msvc build --release
+```
 
-If you want to inspect the behavior or audit the code, everything is in this repository.
+Release output:
+
+```text
+target\release\claude-code-usage-monitor.exe
+```
+
+If the build cannot overwrite the release exe, stop the running app first:
+
+```powershell
+Get-Process claude-code-usage-monitor | Stop-Process
+```
+
+## Run
+
+After building, launch:
+
+```powershell
+.\target\release\claude-code-usage-monitor.exe
+```
+
+The widget reads and writes its settings through `%APPDATA%`, not beside the exe.
+
+## Diagnostics
+
+Run with:
+
+```powershell
+claude-code-usage-monitor --diagnose
+```
+
+Log file:
+
+```text
+%TEMP%\claude-code-usage-monitor.log
+```
+
+## Privacy And Security
+
+This project can access authenticated usage information and should be handled carefully.
+
+Please keep these rules:
+
+- Never commit `%APPDATA%\ClaudeCodeUsageMonitor\settings.json`
+- Never commit real `admin_api_key` values
+- Never commit local auth files such as `.codex/auth.json` or `.claude/.credentials.json`
+- Never publish logs that contain sensitive headers, tokens, or private endpoints
+
+This repository should contain only source code and safe documentation.
+
+## Git Hygiene
+
+Before pushing:
+
+- verify `.gitignore` excludes local artifacts
+- review `git status`
+- scan staged changes for keys, tokens, private hostnames, and local config
+
+Recommended quick checks:
+
+```powershell
+git status
+git diff --staged
+rg -n "admin-[a-f0-9]{20,}|sk-[A-Za-z0-9_-]{10,}|api[_-]?key|bearer" .
+```
+
+## License
+
+This project remains under the MIT license inherited from the upstream project unless changed explicitly by repository owners.

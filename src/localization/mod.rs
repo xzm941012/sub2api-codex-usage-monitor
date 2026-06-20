@@ -4,10 +4,11 @@ mod french;
 mod german;
 mod japanese;
 mod korean;
+mod portuguese_brazil;
+mod russian;
+mod simplified_chinese;
 mod spanish;
 mod traditional_chinese;
-mod russian;
-mod portuguese_brazil;
 
 use windows::core::PWSTR;
 use windows::Win32::Globalization::{
@@ -24,13 +25,14 @@ pub enum LanguageId {
     German,
     Japanese,
     Korean,
+    SimplifiedChinese,
     TraditionalChinese,
     Russian,
     PortugueseBrazil,
 }
 
 impl LanguageId {
-    pub const ALL: [LanguageId; 10] = [
+    pub const ALL: [LanguageId; 11] = [
         LanguageId::English,
         LanguageId::Dutch,
         LanguageId::Spanish,
@@ -38,6 +40,7 @@ impl LanguageId {
         LanguageId::German,
         LanguageId::Japanese,
         LanguageId::Korean,
+        LanguageId::SimplifiedChinese,
         LanguageId::TraditionalChinese,
         LanguageId::Russian,
         LanguageId::PortugueseBrazil,
@@ -52,6 +55,7 @@ impl LanguageId {
             Self::German => "de",
             Self::Japanese => "ja",
             Self::Korean => "ko",
+            Self::SimplifiedChinese => "zh-CN",
             Self::TraditionalChinese => "zh-TW",
             Self::Russian => "ru",
             Self::PortugueseBrazil => "pt-BR",
@@ -67,6 +71,7 @@ impl LanguageId {
             Self::German => "Deutsch",
             Self::Japanese => "日本語",
             Self::Korean => "한국어",
+            Self::SimplifiedChinese => "简体中文",
             Self::TraditionalChinese => "繁體中文",
             Self::Russian => "Русский",
             Self::PortugueseBrazil => "Português (Brasil)",
@@ -82,6 +87,7 @@ impl LanguageId {
             Self::German => german::STRINGS,
             Self::Japanese => japanese::STRINGS,
             Self::Korean => korean::STRINGS,
+            Self::SimplifiedChinese => simplified_chinese::STRINGS,
             Self::TraditionalChinese => traditional_chinese::STRINGS,
             Self::Russian => russian::STRINGS,
             Self::PortugueseBrazil => portuguese_brazil::STRINGS,
@@ -97,6 +103,7 @@ impl LanguageId {
             Self::German => german::UPDATE_VIA_WINGET_LABEL,
             Self::Japanese => japanese::UPDATE_VIA_WINGET_LABEL,
             Self::Korean => korean::UPDATE_VIA_WINGET_LABEL,
+            Self::SimplifiedChinese => simplified_chinese::UPDATE_VIA_WINGET_LABEL,
             Self::TraditionalChinese => traditional_chinese::UPDATE_VIA_WINGET_LABEL,
             Self::Russian => russian::UPDATE_VIA_WINGET_LABEL,
             Self::PortugueseBrazil => portuguese_brazil::UPDATE_VIA_WINGET_LABEL,
@@ -125,7 +132,7 @@ impl LanguageId {
                 {
                     Some(Self::TraditionalChinese)
                 } else {
-                    None
+                    Some(Self::SimplifiedChinese)
                 }
             }
             "ru" => Some(Self::Russian),
