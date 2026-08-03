@@ -71,6 +71,7 @@ struct AppState {
     show_claude_code: bool,
     show_codex: bool,
     placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
     widget_theme: WidgetTheme,
     progress_color_mode: ProgressColorMode,
     floating_x: Option<i32>,
@@ -136,7 +137,20 @@ enum PlacementMode {
 
 impl Default for PlacementMode {
     fn default() -> Self {
-        Self::Fixed
+        Self::Floating
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FloatingDisplayMode {
+    Bubble,
+    Bars,
+}
+
+impl Default for FloatingDisplayMode {
+    fn default() -> Self {
+        Self::Bubble
     }
 }
 
@@ -205,6 +219,8 @@ const IDM_THEME_LIGHT: u16 = 72;
 const IDM_THEME_DARK: u16 = 73;
 const IDM_COLOR_MONO: u16 = 74;
 const IDM_COLOR_ANTD: u16 = 75;
+const IDM_FLOATING_BUBBLE: u16 = 76;
+const IDM_FLOATING_BARS: u16 = 77;
 const IDM_LANG_SYSTEM: u16 = 100;
 const IDM_LANG_ENGLISH: u16 = 101;
 const IDM_LANG_DUTCH: u16 = 102;
@@ -326,6 +342,8 @@ struct SettingsFile {
     #[serde(default)]
     placement_mode: PlacementMode,
     #[serde(default)]
+    floating_display_mode: FloatingDisplayMode,
+    #[serde(default)]
     widget_theme: WidgetTheme,
     #[serde(default)]
     progress_color_mode: ProgressColorMode,
@@ -365,7 +383,8 @@ impl Default for SettingsFile {
             widget_visible: true,
             show_claude_code: false,
             show_codex: true,
-            placement_mode: PlacementMode::Fixed,
+            placement_mode: PlacementMode::Floating,
+            floating_display_mode: FloatingDisplayMode::Bubble,
             widget_theme: WidgetTheme::Dark,
             progress_color_mode: ProgressColorMode::Mono,
             floating_x: None,
@@ -405,6 +424,9 @@ fn load_settings() -> SettingsFile {
     }
     settings.show_claude_code = false;
     settings.show_codex = true;
+    if settings.floating_display_mode == FloatingDisplayMode::Bubble {
+        settings.edge_collapse = EdgeCollapse::None;
+    }
     settings
 }
 
@@ -433,6 +455,7 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             placement_mode: s.placement_mode,
+            floating_display_mode: s.floating_display_mode,
             widget_theme: s.widget_theme,
             progress_color_mode: s.progress_color_mode,
             floating_x: s.floating_x,
@@ -1046,6 +1069,7 @@ const MODEL_RIGHT_MARGIN: i32 = 5;
 const RIGHT_MARGIN: i32 = 2;
 const WIDGET_HEIGHT: i32 = 46;
 const FLOATING_WIDGET_HEIGHT: i32 = 58;
+const FLOATING_BUBBLE_SIZE: i32 = 54;
 const FLOATING_CORNER_RADIUS: i32 = 10;
 const FLOATING_TRANSPARENT_KEY: u32 = 0x00FF00FF;
 const FLOATING_EDGE_MARGIN: i32 = 18;
@@ -1080,12 +1104,21 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    let main_width =
-        total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex));
+    let main_width = main_widget_width_for_state(state);
     if state.detail_visible && state.placement_mode == PlacementMode::Floating {
         main_width.max(sc(DETAIL_PANEL_WIDTH))
     } else {
         main_width
+    }
+}
+
+fn main_widget_width_for_state(state: &AppState) -> i32 {
+    if state.placement_mode == PlacementMode::Floating
+        && state.floating_display_mode == FloatingDisplayMode::Bubble
+    {
+        sc(FLOATING_BUBBLE_SIZE)
+    } else {
+        total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex))
     }
 }
 
@@ -1104,11 +1137,7 @@ fn detail_row_count_for_state(state: &AppState) -> usize {
 }
 
 fn widget_height_for_state(state: &AppState) -> i32 {
-    let base = if state.placement_mode == PlacementMode::Floating {
-        sc(FLOATING_WIDGET_HEIGHT)
-    } else {
-        sc(WIDGET_HEIGHT)
-    };
+    let base = main_widget_height_for_state(state);
     if state.detail_visible && state.placement_mode == PlacementMode::Floating {
         base + detail_panel_height_for_rows(detail_row_count_for_state(state))
     } else {
@@ -1116,13 +1145,24 @@ fn widget_height_for_state(state: &AppState) -> i32 {
     }
 }
 
+fn main_widget_height_for_state(state: &AppState) -> i32 {
+    main_widget_height_for_placement(state.placement_mode, state.floating_display_mode)
+}
+
 fn detail_panel_height_for_rows(rows: usize) -> i32 {
     sc(DETAIL_PANEL_PADDING * 2 + DETAIL_ROW_HEIGHT * rows as i32 + 12)
 }
 
-fn main_widget_height_for_placement(placement_mode: PlacementMode) -> i32 {
+fn main_widget_height_for_placement(
+    placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
+) -> i32 {
     if placement_mode == PlacementMode::Floating {
-        sc(FLOATING_WIDGET_HEIGHT)
+        if floating_display_mode == FloatingDisplayMode::Bubble {
+            sc(FLOATING_BUBBLE_SIZE)
+        } else {
+            sc(FLOATING_WIDGET_HEIGHT)
+        }
     } else {
         sc(WIDGET_HEIGHT)
     }
@@ -1139,15 +1179,7 @@ fn current_widget_height() -> i32 {
 fn total_widget_width() -> i32 {
     let state = {
         let state = lock_state();
-        state.as_ref().map(|s| {
-            let main_width =
-                total_widget_width_for(active_model_count(s.show_claude_code, s.show_codex));
-            if s.detail_visible && s.placement_mode == PlacementMode::Floating {
-                main_width.max(sc(DETAIL_PANEL_WIDTH))
-            } else {
-                main_width
-            }
-        })
+        state.as_ref().map(total_widget_width_for_state)
     };
     match state {
         Some(width) => width,
@@ -1267,6 +1299,13 @@ pub fn run() {
         let title = native_interop::wide_str(language.strings().window_title);
         let initial_model_count =
             active_model_count(settings.show_claude_code, settings.show_codex);
+        let initial_width = if settings.placement_mode == PlacementMode::Floating
+            && settings.floating_display_mode == FloatingDisplayMode::Bubble
+        {
+            sc(FLOATING_BUBBLE_SIZE)
+        } else {
+            total_widget_width_for(initial_model_count)
+        };
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -1274,12 +1313,11 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
-            if settings.placement_mode == PlacementMode::Floating {
-                sc(FLOATING_WIDGET_HEIGHT)
-            } else {
-                sc(WIDGET_HEIGHT)
-            },
+            initial_width,
+            main_widget_height_for_placement(
+                settings.placement_mode,
+                settings.floating_display_mode,
+            ),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -1333,6 +1371,7 @@ pub fn run() {
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 placement_mode: settings.placement_mode,
+                floating_display_mode: settings.floating_display_mode,
                 widget_theme: settings.widget_theme,
                 progress_color_mode: settings.progress_color_mode,
                 floating_x: settings.floating_x,
@@ -1503,6 +1542,7 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         placement_mode,
+        floating_display_mode,
         widget_theme,
         progress_color_mode,
         edge_collapse,
@@ -1527,6 +1567,7 @@ fn render_layered() {
                 s.show_claude_code,
                 s.show_codex,
                 s.placement_mode,
+                s.floating_display_mode,
                 s.widget_theme,
                 s.progress_color_mode,
                 s.edge_collapse,
@@ -1540,7 +1581,13 @@ fn render_layered() {
     let hwnd = hwnd_val.to_hwnd();
 
     let width = total_widget_width();
-    let main_width = total_widget_width_for(active_model_count(show_claude_code, show_codex));
+    let main_width = if placement_mode == PlacementMode::Floating
+        && floating_display_mode == FloatingDisplayMode::Bubble
+    {
+        sc(FLOATING_BUBBLE_SIZE)
+    } else {
+        total_widget_width_for(active_model_count(show_claude_code, show_codex))
+    };
     let expanded_header = detail_visible && placement_mode == PlacementMode::Floating;
     let main_surface_width = if expanded_header { width } else { main_width };
     let height = current_widget_height();
@@ -1640,7 +1687,7 @@ fn render_layered() {
         paint_content(
             mem_dc,
             main_surface_width,
-            main_widget_height_for_placement(placement_mode),
+            main_widget_height_for_placement(placement_mode, floating_display_mode),
             is_dark,
             &bg_color,
             &text_color,
@@ -1658,6 +1705,7 @@ fn render_layered() {
             show_claude_code,
             show_codex,
             placement_mode,
+            floating_display_mode,
             progress_color_mode,
             if edge_expanded {
                 EdgeCollapse::None
@@ -1745,6 +1793,7 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
     progress_color_mode: ProgressColorMode,
     edge_collapse: EdgeCollapse,
     codex_accent: &Color,
@@ -1757,6 +1806,16 @@ fn paint_content(
             right: width,
             bottom: main_height,
         };
+
+        if placement_mode == PlacementMode::Floating
+            && floating_display_mode == FloatingDisplayMode::Bubble
+        {
+            let clear_brush = CreateSolidBrush(COLORREF(native_interop::colorref(255, 0, 255)));
+            FillRect(hdc, &client_rect, clear_brush);
+            let _ = DeleteObject(clear_brush);
+            draw_floating_bubble(hdc, width, main_height, text_color);
+            return;
+        }
 
         if placement_mode == PlacementMode::Floating {
             let clear_brush = CreateSolidBrush(COLORREF(native_interop::colorref(255, 0, 255)));
@@ -1943,20 +2002,53 @@ fn paint_content(
 }
 
 fn draw_ikun_badge(hdc: HDC, width: i32, height: i32, show_claude_code: bool, show_codex: bool) {
-    const IKUN_BMP: &[u8] = include_bytes!("icons/ikun.bmp");
-    const BMP_PIXEL_OFFSET: usize = 54;
-    const BMP_SIZE: i32 = 128;
-
     let natural_width = total_widget_width_for(active_model_count(show_claude_code, show_codex));
     let left = natural_width + sc(8);
     let right = width - sc(16);
-    if right <= left || IKUN_BMP.len() <= BMP_PIXEL_OFFSET {
+    if right <= left {
         return;
     }
 
     let badge_size = (height - sc(10)).min(right - left).max(sc(1));
     let x = left + (right - left - badge_size) / 2;
     let y = (height - badge_size) / 2;
+    draw_ikun_bitmap(hdc, x, y, badge_size);
+}
+
+fn draw_floating_bubble(hdc: HDC, width: i32, height: i32, border_color: &Color) {
+    let size = width.min(height) - sc(4);
+    if size <= 0 {
+        return;
+    }
+    let x = (width - size) / 2;
+    let y = (height - size) / 2;
+
+    unsafe {
+        let clip = CreateEllipticRgn(x, y, x + size, y + size);
+        let _ = SelectClipRgn(hdc, clip);
+        draw_ikun_bitmap(hdc, x, y, size);
+        let _ = SelectClipRgn(hdc, HRGN::default());
+        let _ = DeleteObject(clip);
+
+        let pen = CreatePen(PS_SOLID, sc(1), COLORREF(border_color.to_colorref()));
+        let old_pen = SelectObject(hdc, pen);
+        let hollow = GetStockObject(NULL_BRUSH);
+        let old_brush = SelectObject(hdc, hollow);
+        let _ = Ellipse(hdc, x, y, x + size, y + size);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen);
+    }
+}
+
+fn draw_ikun_bitmap(hdc: HDC, x: i32, y: i32, size: i32) {
+    const IKUN_BMP: &[u8] = include_bytes!("icons/ikun.bmp");
+    const BMP_PIXEL_OFFSET: usize = 54;
+    const BMP_SIZE: i32 = 128;
+    if size <= 0 || IKUN_BMP.len() <= BMP_PIXEL_OFFSET {
+        return;
+    }
+
     let bitmap_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -1977,8 +2069,8 @@ fn draw_ikun_badge(hdc: HDC, width: i32, height: i32, show_claude_code: bool, sh
             hdc,
             x,
             y,
-            badge_size,
-            badge_size,
+            size,
+            size,
             0,
             0,
             BMP_SIZE,
@@ -3211,7 +3303,11 @@ unsafe extern "system" fn wnd_proc(
                         let desired_x = s.drag_start_floating_x + (pt.x - s.drag_start_mouse_x);
                         let desired_y = s.drag_start_floating_y + (pt.y - s.drag_start_mouse_y);
                         let work = work_area_rect();
-                        let edge = floating_edge_for_position(desired_x, full_width, &work);
+                        let edge = if s.floating_display_mode == FloatingDisplayMode::Bubble {
+                            EdgeCollapse::None
+                        } else {
+                            floating_edge_for_position(desired_x, full_width, &work)
+                        };
                         let widget_width = full_width;
                         let (mut new_x, new_y) = clamp_floating_position(
                             desired_x,
@@ -3556,6 +3652,27 @@ unsafe extern "system" fn wnd_proc(
                             }
                         }
                     }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
+                IDM_FLOATING_BUBBLE | IDM_FLOATING_BARS => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.floating_display_mode = if id == IDM_FLOATING_BUBBLE {
+                                FloatingDisplayMode::Bubble
+                            } else {
+                                FloatingDisplayMode::Bars
+                            };
+                            s.edge_animation = None;
+                            if s.floating_display_mode == FloatingDisplayMode::Bubble {
+                                s.edge_collapse = EdgeCollapse::None;
+                                s.edge_expanded = false;
+                            }
+                        }
+                    }
+                    let _ = KillTimer(hwnd, TIMER_EDGE_ANIMATION);
                     save_state_settings();
                     position_at_taskbar();
                     render_layered();
@@ -4021,7 +4138,16 @@ fn paint_detail_layered(hwnd: HWND, width: i32, height: i32) {
 }
 
 fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
-    let (items, summary, placement_mode, widget_theme, progress_color_mode, strings, hwnd) = {
+    let (
+        items,
+        summary,
+        placement_mode,
+        floating_display_mode,
+        widget_theme,
+        progress_color_mode,
+        strings,
+        hwnd,
+    ) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
             return;
@@ -4035,6 +4161,7 @@ fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
                 .filter(|codex| !codex.account_details.is_empty())
                 .map(usage_summary::summarize),
             s.placement_mode,
+            s.floating_display_mode,
             s.widget_theme,
             s.progress_color_mode,
             s.language.strings(),
@@ -4105,7 +4232,7 @@ fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
         let top = if placement_mode == PlacementMode::Fixed {
             sc(2)
         } else {
-            sc(FLOATING_WIDGET_HEIGHT) + sc(2)
+            main_widget_height_for_placement(placement_mode, floating_display_mode) + sc(2)
         };
         let hover_pt = detail_hover_point(hwnd);
         if items.is_empty() {
@@ -4707,6 +4834,7 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             show_codex,
             placement_mode,
+            floating_display_mode,
             widget_theme,
             progress_color_mode,
             sub2api_groups,
@@ -4728,6 +4856,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.show_codex,
                     s.placement_mode,
+                    s.floating_display_mode,
                     s.widget_theme,
                     s.progress_color_mode,
                     s.sub2api_groups.clone(),
@@ -4746,6 +4875,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     false,
                     PlacementMode::Fixed,
+                    FloatingDisplayMode::Bubble,
                     WidgetTheme::Dark,
                     ProgressColorMode::Mono,
                     Vec::new(),
@@ -4915,6 +5045,37 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             placement_menu.0 as usize,
             PCWSTR::from_raw(placement_label.as_ptr()),
+        );
+
+        let floating_style_menu = CreatePopupMenu().unwrap();
+        let bubble_label = native_interop::wide_str("圆球（默认）");
+        let bars_label = native_interop::wide_str("用量条");
+        let _ = AppendMenuW(
+            floating_style_menu,
+            if floating_display_mode == FloatingDisplayMode::Bubble {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_FLOATING_BUBBLE as usize,
+            PCWSTR::from_raw(bubble_label.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            floating_style_menu,
+            if floating_display_mode == FloatingDisplayMode::Bars {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_FLOATING_BARS as usize,
+            PCWSTR::from_raw(bars_label.as_ptr()),
+        );
+        let floating_style_label = native_interop::wide_str("浮窗样式");
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            floating_style_menu.0 as usize,
+            PCWSTR::from_raw(floating_style_label.as_ptr()),
         );
 
         let theme_menu = CreatePopupMenu().unwrap();
@@ -5128,6 +5289,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         placement_mode,
+        floating_display_mode,
         widget_theme,
         progress_color_mode,
         edge_collapse,
@@ -5149,6 +5311,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_claude_code,
                 s.show_codex,
                 s.placement_mode,
+                s.floating_display_mode,
                 s.widget_theme,
                 s.progress_color_mode,
                 s.edge_collapse,
@@ -5226,6 +5389,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_claude_code,
             show_codex,
             placement_mode,
+            floating_display_mode,
             progress_color_mode,
             if edge_expanded {
                 EdgeCollapse::None
@@ -5461,5 +5625,23 @@ fn draw_rounded_frame(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         SelectObject(hdc, old_brush);
         SelectObject(hdc, old_pen);
         let _ = DeleteObject(pen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_settings_default_to_floating_bubble() {
+        let settings = SettingsFile::default();
+        assert_eq!(settings.placement_mode, PlacementMode::Floating);
+        assert_eq!(settings.floating_display_mode, FloatingDisplayMode::Bubble);
+    }
+
+    #[test]
+    fn legacy_settings_without_display_mode_use_bubble() {
+        let settings: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.floating_display_mode, FloatingDisplayMode::Bubble);
     }
 }
