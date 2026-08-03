@@ -147,21 +147,31 @@ pub fn float_as_topmost(hwnd: HWND) {
             ex_style
                 | WS_EX_TOOLWINDOW.0 as i32
                 | WS_EX_LAYERED.0 as i32
-                | WS_EX_NOACTIVATE.0 as i32,
+                | WS_EX_NOACTIVATE.0 as i32
+                | WS_EX_TOPMOST.0 as i32,
         );
 
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !WS_CHILD_STYLE) | WS_POPUP_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
+        let _ = ensure_topmost(hwnd, true);
+    }
+}
+
+/// Reassert the topmost z-order without activating, moving, or resizing the window.
+pub fn ensure_topmost(hwnd: HWND, frame_changed: bool) -> bool {
+    let mut flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+    unsafe {
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let style_changed = ex_style & WS_EX_TOPMOST.0 as i32 == 0;
+        if style_changed {
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOPMOST.0 as i32);
+        }
+        if frame_changed || style_changed {
+            flags |= SWP_FRAMECHANGED;
+        }
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags).is_ok()
+            && GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as i32 != 0
     }
 }
 

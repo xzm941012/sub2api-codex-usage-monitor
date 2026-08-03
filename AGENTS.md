@@ -83,6 +83,9 @@ Sub2API group list is fetched dynamically. Group switching and usage polling are
 
 ## Editing Guidance
 
+- For code-related inspection and terminal work, prefer the FastCtx MCP tools when they are available: use `mcp__fastctx__read` for reads, `mcp__fastctx__grep` for searches, `mcp__fastctx__glob` for file discovery, and `mcp__fastctx__run` for non-interactive commands.
+- Use `mcp__fastctx__replace` for mechanical replacements across files. Continue to use `apply_patch` for generated content, semantic rewrites, and small targeted edits.
+- If FastCtx is unavailable in the current session, fall back to the built-in filesystem and shell tools and mention the fallback briefly.
 - Keep changes narrow. `window.rs` is large and stateful; read the relevant branch carefully before editing.
 - Follow the existing style. This project is mostly straightforward Rust plus direct Win32 API calls, not heavy abstraction.
 - Use `apply_patch` for edits.
