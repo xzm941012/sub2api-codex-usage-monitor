@@ -71,6 +71,7 @@ struct AppState {
     show_claude_code: bool,
     show_codex: bool,
     placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
     widget_theme: WidgetTheme,
     progress_color_mode: ProgressColorMode,
     floating_x: Option<i32>,
@@ -136,7 +137,21 @@ enum PlacementMode {
 
 impl Default for PlacementMode {
     fn default() -> Self {
-        Self::Fixed
+        Self::Floating
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FloatingDisplayMode {
+    Bubble,
+    // Retained only so older settings containing `"bars"` still deserialize.
+    Bars,
+}
+
+impl Default for FloatingDisplayMode {
+    fn default() -> Self {
+        Self::Bubble
     }
 }
 
@@ -326,6 +341,8 @@ struct SettingsFile {
     #[serde(default)]
     placement_mode: PlacementMode,
     #[serde(default)]
+    floating_display_mode: FloatingDisplayMode,
+    #[serde(default)]
     widget_theme: WidgetTheme,
     #[serde(default)]
     progress_color_mode: ProgressColorMode,
@@ -365,7 +382,8 @@ impl Default for SettingsFile {
             widget_visible: true,
             show_claude_code: false,
             show_codex: true,
-            placement_mode: PlacementMode::Fixed,
+            placement_mode: PlacementMode::Floating,
+            floating_display_mode: FloatingDisplayMode::Bubble,
             widget_theme: WidgetTheme::Dark,
             progress_color_mode: ProgressColorMode::Mono,
             floating_x: None,
@@ -405,6 +423,12 @@ fn load_settings() -> SettingsFile {
     }
     settings.show_claude_code = false;
     settings.show_codex = true;
+    // Floating mode now has exactly two UI states: a compact bubble and the
+    // expanded detail view. Migrate the removed usage-bar mode silently.
+    if settings.floating_display_mode == FloatingDisplayMode::Bars {
+        settings.floating_display_mode = FloatingDisplayMode::Bubble;
+    }
+    settings.edge_collapse = EdgeCollapse::None;
     settings
 }
 
@@ -433,6 +457,7 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             placement_mode: s.placement_mode,
+            floating_display_mode: s.floating_display_mode,
             widget_theme: s.widget_theme,
             progress_color_mode: s.progress_color_mode,
             floating_x: s.floating_x,
@@ -1046,6 +1071,7 @@ const MODEL_RIGHT_MARGIN: i32 = 5;
 const RIGHT_MARGIN: i32 = 2;
 const WIDGET_HEIGHT: i32 = 46;
 const FLOATING_WIDGET_HEIGHT: i32 = 58;
+const FLOATING_BUBBLE_SIZE: i32 = 66;
 const FLOATING_CORNER_RADIUS: i32 = 10;
 const FLOATING_TRANSPARENT_KEY: u32 = 0x00FF00FF;
 const FLOATING_EDGE_MARGIN: i32 = 18;
@@ -1080,12 +1106,23 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    let main_width =
-        total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex));
+    let main_width = main_widget_width_for_state(state);
     if state.detail_visible && state.placement_mode == PlacementMode::Floating {
         main_width.max(sc(DETAIL_PANEL_WIDTH))
     } else {
         main_width
+    }
+}
+
+fn main_widget_width_for_state(state: &AppState) -> i32 {
+    if is_floating_bubble_collapsed(
+        state.placement_mode,
+        state.floating_display_mode,
+        state.detail_visible,
+    ) {
+        sc(FLOATING_BUBBLE_SIZE)
+    } else {
+        total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex))
     }
 }
 
@@ -1104,11 +1141,7 @@ fn detail_row_count_for_state(state: &AppState) -> usize {
 }
 
 fn widget_height_for_state(state: &AppState) -> i32 {
-    let base = if state.placement_mode == PlacementMode::Floating {
-        sc(FLOATING_WIDGET_HEIGHT)
-    } else {
-        sc(WIDGET_HEIGHT)
-    };
+    let base = main_widget_height_for_state(state);
     if state.detail_visible && state.placement_mode == PlacementMode::Floating {
         base + detail_panel_height_for_rows(detail_row_count_for_state(state))
     } else {
@@ -1116,16 +1149,42 @@ fn widget_height_for_state(state: &AppState) -> i32 {
     }
 }
 
+fn main_widget_height_for_state(state: &AppState) -> i32 {
+    main_widget_height_for_placement(
+        state.placement_mode,
+        state.floating_display_mode,
+        state.detail_visible,
+    )
+}
+
 fn detail_panel_height_for_rows(rows: usize) -> i32 {
     sc(DETAIL_PANEL_PADDING * 2 + DETAIL_ROW_HEIGHT * rows as i32 + 12)
 }
 
-fn main_widget_height_for_placement(placement_mode: PlacementMode) -> i32 {
+fn main_widget_height_for_placement(
+    placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
+    detail_visible: bool,
+) -> i32 {
     if placement_mode == PlacementMode::Floating {
-        sc(FLOATING_WIDGET_HEIGHT)
+        if is_floating_bubble_collapsed(placement_mode, floating_display_mode, detail_visible) {
+            sc(FLOATING_BUBBLE_SIZE)
+        } else {
+            sc(FLOATING_WIDGET_HEIGHT)
+        }
     } else {
         sc(WIDGET_HEIGHT)
     }
+}
+
+fn is_floating_bubble_collapsed(
+    placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
+    detail_visible: bool,
+) -> bool {
+    placement_mode == PlacementMode::Floating
+        && floating_display_mode == FloatingDisplayMode::Bubble
+        && !detail_visible
 }
 
 fn current_widget_height() -> i32 {
@@ -1139,15 +1198,7 @@ fn current_widget_height() -> i32 {
 fn total_widget_width() -> i32 {
     let state = {
         let state = lock_state();
-        state.as_ref().map(|s| {
-            let main_width =
-                total_widget_width_for(active_model_count(s.show_claude_code, s.show_codex));
-            if s.detail_visible && s.placement_mode == PlacementMode::Floating {
-                main_width.max(sc(DETAIL_PANEL_WIDTH))
-            } else {
-                main_width
-            }
-        })
+        state.as_ref().map(total_widget_width_for_state)
     };
     match state {
         Some(width) => width,
@@ -1267,6 +1318,13 @@ pub fn run() {
         let title = native_interop::wide_str(language.strings().window_title);
         let initial_model_count =
             active_model_count(settings.show_claude_code, settings.show_codex);
+        let initial_width = if settings.placement_mode == PlacementMode::Floating
+            && settings.floating_display_mode == FloatingDisplayMode::Bubble
+        {
+            sc(FLOATING_BUBBLE_SIZE)
+        } else {
+            total_widget_width_for(initial_model_count)
+        };
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -1274,12 +1332,12 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
-            if settings.placement_mode == PlacementMode::Floating {
-                sc(FLOATING_WIDGET_HEIGHT)
-            } else {
-                sc(WIDGET_HEIGHT)
-            },
+            initial_width,
+            main_widget_height_for_placement(
+                settings.placement_mode,
+                settings.floating_display_mode,
+                false,
+            ),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -1333,6 +1391,7 @@ pub fn run() {
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 placement_mode: settings.placement_mode,
+                floating_display_mode: settings.floating_display_mode,
                 widget_theme: settings.widget_theme,
                 progress_color_mode: settings.progress_color_mode,
                 floating_x: settings.floating_x,
@@ -1503,6 +1562,7 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         placement_mode,
+        floating_display_mode,
         widget_theme,
         progress_color_mode,
         edge_collapse,
@@ -1527,6 +1587,7 @@ fn render_layered() {
                 s.show_claude_code,
                 s.show_codex,
                 s.placement_mode,
+                s.floating_display_mode,
                 s.widget_theme,
                 s.progress_color_mode,
                 s.edge_collapse,
@@ -1540,7 +1601,12 @@ fn render_layered() {
     let hwnd = hwnd_val.to_hwnd();
 
     let width = total_widget_width();
-    let main_width = total_widget_width_for(active_model_count(show_claude_code, show_codex));
+    let main_width =
+        if is_floating_bubble_collapsed(placement_mode, floating_display_mode, detail_visible) {
+            sc(FLOATING_BUBBLE_SIZE)
+        } else {
+            total_widget_width_for(active_model_count(show_claude_code, show_codex))
+        };
     let expanded_header = detail_visible && placement_mode == PlacementMode::Floating;
     let main_surface_width = if expanded_header { width } else { main_width };
     let height = current_widget_height();
@@ -1640,7 +1706,7 @@ fn render_layered() {
         paint_content(
             mem_dc,
             main_surface_width,
-            main_widget_height_for_placement(placement_mode),
+            main_widget_height_for_placement(placement_mode, floating_display_mode, detail_visible),
             is_dark,
             &bg_color,
             &text_color,
@@ -1658,6 +1724,7 @@ fn render_layered() {
             show_claude_code,
             show_codex,
             placement_mode,
+            floating_display_mode,
             progress_color_mode,
             if edge_expanded {
                 EdgeCollapse::None
@@ -1745,6 +1812,7 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
     progress_color_mode: ProgressColorMode,
     edge_collapse: EdgeCollapse,
     codex_accent: &Color,
@@ -1757,6 +1825,24 @@ fn paint_content(
             right: width,
             bottom: main_height,
         };
+
+        if is_floating_bubble_collapsed(placement_mode, floating_display_mode, wide_header) {
+            let clear_brush = CreateSolidBrush(COLORREF(native_interop::colorref(255, 0, 255)));
+            FillRect(hdc, &client_rect, clear_brush);
+            let _ = DeleteObject(clear_brush);
+            draw_floating_bubble(
+                hdc,
+                width,
+                main_height,
+                bg,
+                text_color,
+                track,
+                codex_accent,
+                codex_session_pct,
+                codex_weekly_pct,
+            );
+            return;
+        }
 
         if placement_mode == PlacementMode::Floating {
             let clear_brush = CreateSolidBrush(COLORREF(native_interop::colorref(255, 0, 255)));
@@ -1897,7 +1983,14 @@ fn paint_content(
         let old_font = SelectObject(hdc, font);
 
         if wide_header {
-            draw_ikun_badge(hdc, width, main_height, show_claude_code, show_codex);
+            draw_header_slogan(
+                hdc,
+                width,
+                main_height,
+                show_claude_code,
+                show_codex,
+                text_color,
+            );
         }
 
         draw_row(
@@ -1942,52 +2035,199 @@ fn paint_content(
     }
 }
 
-fn draw_ikun_badge(hdc: HDC, width: i32, height: i32, show_claude_code: bool, show_codex: bool) {
-    const IKUN_BMP: &[u8] = include_bytes!("icons/ikun.bmp");
-    const BMP_PIXEL_OFFSET: usize = 54;
-    const BMP_SIZE: i32 = 128;
-
+fn draw_header_slogan(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    show_claude_code: bool,
+    show_codex: bool,
+    text_color: &Color,
+) {
     let natural_width = total_widget_width_for(active_model_count(show_claude_code, show_codex));
     let left = natural_width + sc(8);
     let right = width - sc(16);
-    if right <= left || IKUN_BMP.len() <= BMP_PIXEL_OFFSET {
+    if right <= left {
         return;
     }
 
-    let badge_size = (height - sc(10)).min(right - left).max(sc(1));
-    let x = left + (right - left - badge_size) / 2;
-    let y = (height - badge_size) / 2;
-    let bitmap_info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: BMP_SIZE,
-            biHeight: BMP_SIZE,
-            biPlanes: 1,
-            biBitCount: 24,
-            biCompression: BI_RGB.0,
-            biSizeImage: (BMP_SIZE * BMP_SIZE * 3) as u32,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    unsafe {
+        let font_name = native_interop::wide_str("Microsoft YaHei UI");
+        let font = CreateFontW(
+            sc(-13),
+            0,
+            0,
+            0,
+            FW_SEMIBOLD.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(hdc, font);
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let mut text = native_interop::wide_str("天才程序员");
+        let mut rect = RECT {
+            left,
+            top: 0,
+            right,
+            bottom: height,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut text,
+            &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+    }
+}
+
+fn draw_floating_bubble(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    bg: &Color,
+    text_color: &Color,
+    track: &Color,
+    accent: &Color,
+    session_pct: f64,
+    weekly_pct: f64,
+) {
+    let size = width.min(height) - sc(4);
+    if size <= 0 {
+        return;
+    }
+    let x = (width - size) / 2;
+    let y = (height - size) / 2;
 
     unsafe {
-        let _ = SetStretchBltMode(hdc, HALFTONE);
-        let _ = StretchDIBits(
-            hdc,
-            x,
-            y,
-            badge_size,
-            badge_size,
+        let pen = CreatePen(PS_NULL, 0, COLORREF(0));
+        let old_pen = SelectObject(hdc, pen);
+        let brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
+        let old_brush = SelectObject(hdc, brush);
+        let _ = Ellipse(hdc, x, y, x + size, y + size);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(brush);
+
+        let center_x = x + size / 2;
+        let center_y = y + size / 2;
+        let ring_radius = size / 2 - sc(3);
+        let dot_size = sc(3).max(2);
+        let segment_count = 28;
+        let filled_segments =
+            ((weekly_pct.clamp(0.0, 100.0) / 100.0 * segment_count as f64).round() as i32)
+                .clamp(0, segment_count);
+        for index in 0..segment_count {
+            let angle = -std::f64::consts::FRAC_PI_2
+                + std::f64::consts::TAU * index as f64 / segment_count as f64;
+            let dot_x = center_x + (ring_radius as f64 * angle.cos()).round() as i32 - dot_size / 2;
+            let dot_y = center_y + (ring_radius as f64 * angle.sin()).round() as i32 - dot_size / 2;
+            let color = if index < filled_segments {
+                accent
+            } else {
+                track
+            };
+            let dot_brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+            let old_dot_brush = SelectObject(hdc, dot_brush);
+            let _ = Ellipse(hdc, dot_x, dot_y, dot_x + dot_size, dot_y + dot_size);
+            SelectObject(hdc, old_dot_brush);
+            let _ = DeleteObject(dot_brush);
+        }
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen);
+
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let font_name = native_interop::wide_str("Segoe UI");
+        let small_font = CreateFontW(
+            sc(-8),
             0,
             0,
-            BMP_SIZE,
-            BMP_SIZE,
-            Some(IKUN_BMP.as_ptr().add(BMP_PIXEL_OFFSET) as *const std::ffi::c_void),
-            &bitmap_info,
-            DIB_RGB_COLORS,
-            SRCCOPY,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
         );
+        let old_font = SelectObject(hdc, small_font);
+        let mut session_wide =
+            native_interop::wide_str(&format!("5h · {:.0}%", session_pct.clamp(0.0, 100.0)));
+        let mut session_rect = RECT {
+            left: x + sc(9),
+            top: y + sc(11),
+            right: x + size - sc(9),
+            bottom: y + sc(21),
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut session_wide,
+            &mut session_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let main_font = CreateFontW(
+            sc(-15),
+            0,
+            0,
+            0,
+            FW_SEMIBOLD.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        SelectObject(hdc, main_font);
+        let mut weekly_wide =
+            native_interop::wide_str(&format!("{:.0}%", weekly_pct.clamp(0.0, 100.0)));
+        let mut weekly_rect = RECT {
+            left: x + sc(8),
+            top: y + sc(22),
+            right: x + size - sc(8),
+            bottom: y + sc(42),
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut weekly_wide,
+            &mut weekly_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        SelectObject(hdc, small_font);
+        let mut weekly_label_wide = native_interop::wide_str("7d");
+        let mut weekly_label_rect = RECT {
+            left: x + sc(9),
+            top: y + sc(43),
+            right: x + size - sc(9),
+            bottom: y + sc(53),
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut weekly_label_wide,
+            &mut weekly_label_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(main_font);
+        let _ = DeleteObject(small_font);
     }
 }
 
@@ -2676,8 +2916,15 @@ fn resize_widget_at_current_position(hwnd: HWND) {
     let rect = native_interop::get_window_rect_safe(hwnd);
     let work = work_area_rect();
     let (mut x, y) = if let Some(rect) = rect {
+        let left_gap = (rect.left - work.left).max(sc(4));
+        let right_gap = (work.right - rect.right).max(sc(4));
+        let anchored_x = if right_gap <= left_gap {
+            work.right - width - right_gap
+        } else {
+            work.left + left_gap
+        };
         (
-            rect.left.clamp(
+            anchored_x.clamp(
                 work.left + sc(4),
                 (work.right - width - sc(4)).max(work.left + sc(4)),
             ),
@@ -2697,6 +2944,13 @@ fn resize_widget_at_current_position(hwnd: HWND) {
         };
     }
     native_interop::move_window(hwnd, x, y, width, height);
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.floating_x = Some(x);
+            s.floating_y = Some(y);
+        }
+    }
     ensure_floating_topmost(hwnd);
 }
 
@@ -3211,7 +3465,11 @@ unsafe extern "system" fn wnd_proc(
                         let desired_x = s.drag_start_floating_x + (pt.x - s.drag_start_mouse_x);
                         let desired_y = s.drag_start_floating_y + (pt.y - s.drag_start_mouse_y);
                         let work = work_area_rect();
-                        let edge = floating_edge_for_position(desired_x, full_width, &work);
+                        let edge = if s.floating_display_mode == FloatingDisplayMode::Bubble {
+                            EdgeCollapse::None
+                        } else {
+                            floating_edge_for_position(desired_x, full_width, &work)
+                        };
                         let widget_width = full_width;
                         let (mut new_x, new_y) = clamp_floating_position(
                             desired_x,
@@ -4021,7 +4279,16 @@ fn paint_detail_layered(hwnd: HWND, width: i32, height: i32) {
 }
 
 fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
-    let (items, summary, placement_mode, widget_theme, progress_color_mode, strings, hwnd) = {
+    let (
+        items,
+        summary,
+        placement_mode,
+        floating_display_mode,
+        widget_theme,
+        progress_color_mode,
+        strings,
+        hwnd,
+    ) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
             return;
@@ -4035,6 +4302,7 @@ fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
                 .filter(|codex| !codex.account_details.is_empty())
                 .map(usage_summary::summarize),
             s.placement_mode,
+            s.floating_display_mode,
             s.widget_theme,
             s.progress_color_mode,
             s.language.strings(),
@@ -4105,7 +4373,7 @@ fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
         let top = if placement_mode == PlacementMode::Fixed {
             sc(2)
         } else {
-            sc(FLOATING_WIDGET_HEIGHT) + sc(2)
+            main_widget_height_for_placement(placement_mode, floating_display_mode, true) + sc(2)
         };
         let hover_pt = detail_hover_point(hwnd);
         if items.is_empty() {
@@ -5128,6 +5396,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         placement_mode,
+        floating_display_mode,
         widget_theme,
         progress_color_mode,
         edge_collapse,
@@ -5149,6 +5418,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_claude_code,
                 s.show_codex,
                 s.placement_mode,
+                s.floating_display_mode,
                 s.widget_theme,
                 s.progress_color_mode,
                 s.edge_collapse,
@@ -5226,6 +5496,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_claude_code,
             show_codex,
             placement_mode,
+            floating_display_mode,
             progress_color_mode,
             if edge_expanded {
                 EdgeCollapse::None
@@ -5461,5 +5732,44 @@ fn draw_rounded_frame(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         SelectObject(hdc, old_brush);
         SelectObject(hdc, old_pen);
         let _ = DeleteObject(pen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_settings_default_to_floating_bubble() {
+        let settings = SettingsFile::default();
+        assert_eq!(settings.placement_mode, PlacementMode::Floating);
+        assert_eq!(settings.floating_display_mode, FloatingDisplayMode::Bubble);
+    }
+
+    #[test]
+    fn legacy_settings_without_display_mode_use_bubble() {
+        let settings: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.floating_display_mode, FloatingDisplayMode::Bubble);
+    }
+
+    #[test]
+    fn floating_bubble_has_only_collapsed_and_detail_states() {
+        assert!(is_floating_bubble_collapsed(
+            PlacementMode::Floating,
+            FloatingDisplayMode::Bubble,
+            false,
+        ));
+        assert!(!is_floating_bubble_collapsed(
+            PlacementMode::Floating,
+            FloatingDisplayMode::Bubble,
+            true,
+        ));
+    }
+
+    #[test]
+    fn legacy_bar_setting_still_deserializes() {
+        let settings: SettingsFile =
+            serde_json::from_str(r#"{"floating_display_mode":"bars"}"#).unwrap();
+        assert_eq!(settings.floating_display_mode, FloatingDisplayMode::Bars);
     }
 }
