@@ -8,6 +8,7 @@ mod poller;
 mod theme;
 mod tray_icon;
 mod updater;
+mod usage_summary;
 mod window;
 
 fn main() {

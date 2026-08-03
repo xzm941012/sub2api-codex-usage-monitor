@@ -33,7 +33,7 @@ pub(super) const STRINGS: Strings = Strings {
     show_widget: "위젯 표시",
     session_window: "5시간",
     weekly_window: "7일",
-    now: "지금",
+    now: "∞",
     day_suffix: "일",
     hour_suffix: "시간",
     minute_suffix: "분",

@@ -30,6 +30,7 @@ use crate::poller;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
+use crate::usage_summary::{self, UsageSummary, UsageSummarySection};
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
@@ -70,6 +71,7 @@ struct AppState {
     show_claude_code: bool,
     show_codex: bool,
     placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
     widget_theme: WidgetTheme,
     progress_color_mode: ProgressColorMode,
     floating_x: Option<i32>,
@@ -135,7 +137,20 @@ enum PlacementMode {
 
 impl Default for PlacementMode {
     fn default() -> Self {
-        Self::Fixed
+        Self::Floating
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FloatingDisplayMode {
+    Bubble,
+    Bars,
+}
+
+impl Default for FloatingDisplayMode {
+    fn default() -> Self {
+        Self::Bubble
     }
 }
 
@@ -204,6 +219,8 @@ const IDM_THEME_LIGHT: u16 = 72;
 const IDM_THEME_DARK: u16 = 73;
 const IDM_COLOR_MONO: u16 = 74;
 const IDM_COLOR_ANTD: u16 = 75;
+const IDM_FLOATING_BUBBLE: u16 = 76;
+const IDM_FLOATING_BARS: u16 = 77;
 const IDM_LANG_SYSTEM: u16 = 100;
 const IDM_LANG_ENGLISH: u16 = 101;
 const IDM_LANG_DUTCH: u16 = 102;
@@ -226,10 +243,11 @@ const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
-const DETAIL_ROW_HEIGHT: i32 = 126;
-const DETAIL_PANEL_WIDTH: i32 = 306;
-const DETAIL_PANEL_PADDING: i32 = 7;
+const DETAIL_ROW_HEIGHT: i32 = 90;
+const DETAIL_PANEL_WIDTH: i32 = 480;
+const DETAIL_PANEL_PADDING: i32 = 6;
 const DETAIL_PANEL_MAX_ROWS: usize = 6;
+const DETAIL_PANEL_MAX_ACCOUNT_ROWS: usize = DETAIL_PANEL_MAX_ROWS - 1;
 const TIMER_DETAIL_OUTSIDE: usize = 6;
 const TIMER_DETAIL_RENDER: usize = 7;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -324,6 +342,8 @@ struct SettingsFile {
     #[serde(default)]
     placement_mode: PlacementMode,
     #[serde(default)]
+    floating_display_mode: FloatingDisplayMode,
+    #[serde(default)]
     widget_theme: WidgetTheme,
     #[serde(default)]
     progress_color_mode: ProgressColorMode,
@@ -363,7 +383,8 @@ impl Default for SettingsFile {
             widget_visible: true,
             show_claude_code: false,
             show_codex: true,
-            placement_mode: PlacementMode::Fixed,
+            placement_mode: PlacementMode::Floating,
+            floating_display_mode: FloatingDisplayMode::Bubble,
             widget_theme: WidgetTheme::Dark,
             progress_color_mode: ProgressColorMode::Mono,
             floating_x: None,
@@ -403,6 +424,9 @@ fn load_settings() -> SettingsFile {
     }
     settings.show_claude_code = false;
     settings.show_codex = true;
+    if settings.floating_display_mode == FloatingDisplayMode::Bubble {
+        settings.edge_collapse = EdgeCollapse::None;
+    }
     settings
 }
 
@@ -431,6 +455,7 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             placement_mode: s.placement_mode,
+            floating_display_mode: s.floating_display_mode,
             widget_theme: s.widget_theme,
             progress_color_mode: s.progress_color_mode,
             floating_x: s.floating_x,
@@ -548,12 +573,18 @@ fn sync_tray_icons(hwnd: HWND) {
     tray_icon::sync(hwnd, &icons);
 }
 
+fn ensure_floating_topmost(hwnd: HWND) {
+    if !native_interop::ensure_topmost(hwnd, false) {
+        diagnose::log("unable to keep floating widget topmost");
+    }
+}
+
 fn toggle_widget_visibility(hwnd: HWND) {
-    let new_visible = {
+    let (new_visible, placement_mode) = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
             s.widget_visible = !s.widget_visible;
-            s.widget_visible
+            (s.widget_visible, s.placement_mode)
         } else {
             return;
         }
@@ -563,6 +594,9 @@ fn toggle_widget_visibility(hwnd: HWND) {
         if new_visible {
             position_at_taskbar();
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            if placement_mode == PlacementMode::Floating {
+                ensure_floating_topmost(hwnd);
+            }
             render_layered();
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -1035,6 +1069,7 @@ const MODEL_RIGHT_MARGIN: i32 = 5;
 const RIGHT_MARGIN: i32 = 2;
 const WIDGET_HEIGHT: i32 = 46;
 const FLOATING_WIDGET_HEIGHT: i32 = 58;
+const FLOATING_BUBBLE_SIZE: i32 = 54;
 const FLOATING_CORNER_RADIUS: i32 = 10;
 const FLOATING_TRANSPARENT_KEY: u32 = 0x00FF00FF;
 const FLOATING_EDGE_MARGIN: i32 = 18;
@@ -1069,8 +1104,7 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    let main_width =
-        total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex));
+    let main_width = main_widget_width_for_state(state);
     if state.detail_visible && state.placement_mode == PlacementMode::Floating {
         main_width.max(sc(DETAIL_PANEL_WIDTH))
     } else {
@@ -1078,22 +1112,32 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
     }
 }
 
+fn main_widget_width_for_state(state: &AppState) -> i32 {
+    if state.placement_mode == PlacementMode::Floating
+        && state.floating_display_mode == FloatingDisplayMode::Bubble
+    {
+        sc(FLOATING_BUBBLE_SIZE)
+    } else {
+        total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex))
+    }
+}
+
 fn detail_row_count_for_state(state: &AppState) -> usize {
-    state
+    let account_rows = state
         .data
         .as_ref()
         .and_then(|data| data.codex.as_ref())
         .map(|codex| codex.account_details.len())
-        .unwrap_or(0)
-        .clamp(1, DETAIL_PANEL_MAX_ROWS)
+        .unwrap_or(0);
+    if account_rows == 0 {
+        1
+    } else {
+        1 + account_rows.min(DETAIL_PANEL_MAX_ACCOUNT_ROWS)
+    }
 }
 
 fn widget_height_for_state(state: &AppState) -> i32 {
-    let base = if state.placement_mode == PlacementMode::Floating {
-        sc(FLOATING_WIDGET_HEIGHT)
-    } else {
-        sc(WIDGET_HEIGHT)
-    };
+    let base = main_widget_height_for_state(state);
     if state.detail_visible && state.placement_mode == PlacementMode::Floating {
         base + detail_panel_height_for_rows(detail_row_count_for_state(state))
     } else {
@@ -1101,13 +1145,24 @@ fn widget_height_for_state(state: &AppState) -> i32 {
     }
 }
 
+fn main_widget_height_for_state(state: &AppState) -> i32 {
+    main_widget_height_for_placement(state.placement_mode, state.floating_display_mode)
+}
+
 fn detail_panel_height_for_rows(rows: usize) -> i32 {
     sc(DETAIL_PANEL_PADDING * 2 + DETAIL_ROW_HEIGHT * rows as i32 + 12)
 }
 
-fn main_widget_height_for_placement(placement_mode: PlacementMode) -> i32 {
+fn main_widget_height_for_placement(
+    placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
+) -> i32 {
     if placement_mode == PlacementMode::Floating {
-        sc(FLOATING_WIDGET_HEIGHT)
+        if floating_display_mode == FloatingDisplayMode::Bubble {
+            sc(FLOATING_BUBBLE_SIZE)
+        } else {
+            sc(FLOATING_WIDGET_HEIGHT)
+        }
     } else {
         sc(WIDGET_HEIGHT)
     }
@@ -1124,15 +1179,7 @@ fn current_widget_height() -> i32 {
 fn total_widget_width() -> i32 {
     let state = {
         let state = lock_state();
-        state.as_ref().map(|s| {
-            let main_width =
-                total_widget_width_for(active_model_count(s.show_claude_code, s.show_codex));
-            if s.detail_visible && s.placement_mode == PlacementMode::Floating {
-                main_width.max(sc(DETAIL_PANEL_WIDTH))
-            } else {
-                main_width
-            }
-        })
+        state.as_ref().map(total_widget_width_for_state)
     };
     match state {
         Some(width) => width,
@@ -1252,19 +1299,25 @@ pub fn run() {
         let title = native_interop::wide_str(language.strings().window_title);
         let initial_model_count =
             active_model_count(settings.show_claude_code, settings.show_codex);
+        let initial_width = if settings.placement_mode == PlacementMode::Floating
+            && settings.floating_display_mode == FloatingDisplayMode::Bubble
+        {
+            sc(FLOATING_BUBBLE_SIZE)
+        } else {
+            total_widget_width_for(initial_model_count)
+        };
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             PCWSTR::from_raw(class_name.as_ptr()),
             PCWSTR::from_raw(title.as_ptr()),
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
-            if settings.placement_mode == PlacementMode::Floating {
-                sc(FLOATING_WIDGET_HEIGHT)
-            } else {
-                sc(WIDGET_HEIGHT)
-            },
+            initial_width,
+            main_widget_height_for_placement(
+                settings.placement_mode,
+                settings.floating_display_mode,
+            ),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -1318,6 +1371,7 @@ pub fn run() {
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 placement_mode: settings.placement_mode,
+                floating_display_mode: settings.floating_display_mode,
                 widget_theme: settings.widget_theme,
                 progress_color_mode: settings.progress_color_mode,
                 floating_x: settings.floating_x,
@@ -1488,6 +1542,7 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         placement_mode,
+        floating_display_mode,
         widget_theme,
         progress_color_mode,
         edge_collapse,
@@ -1512,6 +1567,7 @@ fn render_layered() {
                 s.show_claude_code,
                 s.show_codex,
                 s.placement_mode,
+                s.floating_display_mode,
                 s.widget_theme,
                 s.progress_color_mode,
                 s.edge_collapse,
@@ -1525,7 +1581,15 @@ fn render_layered() {
     let hwnd = hwnd_val.to_hwnd();
 
     let width = total_widget_width();
-    let main_width = total_widget_width_for(active_model_count(show_claude_code, show_codex));
+    let main_width = if placement_mode == PlacementMode::Floating
+        && floating_display_mode == FloatingDisplayMode::Bubble
+    {
+        sc(FLOATING_BUBBLE_SIZE)
+    } else {
+        total_widget_width_for(active_model_count(show_claude_code, show_codex))
+    };
+    let expanded_header = detail_visible && placement_mode == PlacementMode::Floating;
+    let main_surface_width = if expanded_header { width } else { main_width };
     let height = current_widget_height();
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
@@ -1622,8 +1686,8 @@ fn render_layered() {
         // sub-pixel font rendering that matches the rest of the OS.
         paint_content(
             mem_dc,
-            main_width,
-            main_widget_height_for_placement(placement_mode),
+            main_surface_width,
+            main_widget_height_for_placement(placement_mode, floating_display_mode),
             is_dark,
             &bg_color,
             &text_color,
@@ -1641,6 +1705,7 @@ fn render_layered() {
             show_claude_code,
             show_codex,
             placement_mode,
+            floating_display_mode,
             progress_color_mode,
             if edge_expanded {
                 EdgeCollapse::None
@@ -1648,6 +1713,7 @@ fn render_layered() {
                 edge_collapse
             },
             &codex_accent,
+            expanded_header,
         );
 
         if detail_visible && placement_mode == PlacementMode::Floating {
@@ -1727,9 +1793,11 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     placement_mode: PlacementMode,
+    floating_display_mode: FloatingDisplayMode,
     progress_color_mode: ProgressColorMode,
     edge_collapse: EdgeCollapse,
     codex_accent: &Color,
+    wide_header: bool,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1738,6 +1806,16 @@ fn paint_content(
             right: width,
             bottom: main_height,
         };
+
+        if placement_mode == PlacementMode::Floating
+            && floating_display_mode == FloatingDisplayMode::Bubble
+        {
+            let clear_brush = CreateSolidBrush(COLORREF(native_interop::colorref(255, 0, 255)));
+            FillRect(hdc, &client_rect, clear_brush);
+            let _ = DeleteObject(clear_brush);
+            draw_floating_bubble(hdc, width, main_height, text_color);
+            return;
+        }
 
         if placement_mode == PlacementMode::Floating {
             let clear_brush = CreateSolidBrush(COLORREF(native_interop::colorref(255, 0, 255)));
@@ -1818,7 +1896,13 @@ fn paint_content(
         }
 
         let content_x = if placement_mode == PlacementMode::Floating {
-            sc(12)
+            if wide_header {
+                sc(12)
+            } else {
+                let natural_width =
+                    total_widget_width_for(active_model_count(show_claude_code, show_codex));
+                sc(12) + (width - natural_width).max(0) / 2
+            }
         } else {
             sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN)
         };
@@ -1871,6 +1955,10 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
+        if wide_header {
+            draw_ikun_badge(hdc, width, main_height, show_claude_code, show_codex);
+        }
+
         draw_row(
             hdc,
             content_x,
@@ -1910,6 +1998,88 @@ fn paint_content(
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
+    }
+}
+
+fn draw_ikun_badge(hdc: HDC, width: i32, height: i32, show_claude_code: bool, show_codex: bool) {
+    let natural_width = total_widget_width_for(active_model_count(show_claude_code, show_codex));
+    let left = natural_width + sc(8);
+    let right = width - sc(16);
+    if right <= left {
+        return;
+    }
+
+    let badge_size = (height - sc(10)).min(right - left).max(sc(1));
+    let x = left + (right - left - badge_size) / 2;
+    let y = (height - badge_size) / 2;
+    draw_ikun_bitmap(hdc, x, y, badge_size);
+}
+
+fn draw_floating_bubble(hdc: HDC, width: i32, height: i32, border_color: &Color) {
+    let size = width.min(height) - sc(4);
+    if size <= 0 {
+        return;
+    }
+    let x = (width - size) / 2;
+    let y = (height - size) / 2;
+
+    unsafe {
+        let clip = CreateEllipticRgn(x, y, x + size, y + size);
+        let _ = SelectClipRgn(hdc, clip);
+        draw_ikun_bitmap(hdc, x, y, size);
+        let _ = SelectClipRgn(hdc, HRGN::default());
+        let _ = DeleteObject(clip);
+
+        let pen = CreatePen(PS_SOLID, sc(1), COLORREF(border_color.to_colorref()));
+        let old_pen = SelectObject(hdc, pen);
+        let hollow = GetStockObject(NULL_BRUSH);
+        let old_brush = SelectObject(hdc, hollow);
+        let _ = Ellipse(hdc, x, y, x + size, y + size);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen);
+    }
+}
+
+fn draw_ikun_bitmap(hdc: HDC, x: i32, y: i32, size: i32) {
+    const IKUN_BMP: &[u8] = include_bytes!("icons/ikun.bmp");
+    const BMP_PIXEL_OFFSET: usize = 54;
+    const BMP_SIZE: i32 = 128;
+    if size <= 0 || IKUN_BMP.len() <= BMP_PIXEL_OFFSET {
+        return;
+    }
+
+    let bitmap_info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: BMP_SIZE,
+            biHeight: BMP_SIZE,
+            biPlanes: 1,
+            biBitCount: 24,
+            biCompression: BI_RGB.0,
+            biSizeImage: (BMP_SIZE * BMP_SIZE * 3) as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    unsafe {
+        let _ = SetStretchBltMode(hdc, HALFTONE);
+        let _ = StretchDIBits(
+            hdc,
+            x,
+            y,
+            size,
+            size,
+            0,
+            0,
+            BMP_SIZE,
+            BMP_SIZE,
+            Some(IKUN_BMP.as_ptr().add(BMP_PIXEL_OFFSET) as *const std::ffi::c_void),
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
     }
 }
 
@@ -2201,6 +2371,7 @@ fn tick_edge_animation(hwnd: HWND) {
 
     native_interop::move_window(hwnd, x, y, width, height);
     if finished {
+        ensure_floating_topmost(hwnd);
         unsafe {
             let _ = KillTimer(hwnd, TIMER_EDGE_ANIMATION);
         }
@@ -2575,7 +2746,7 @@ fn refresh_widget_theme_and_layout() {
 }
 
 fn resize_widget_at_current_position(hwnd: HWND) {
-    let (width, height, placement_mode) = {
+    let (width, height, placement_mode, edge_collapse, edge_expanded) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
             return;
@@ -2584,6 +2755,8 @@ fn resize_widget_at_current_position(hwnd: HWND) {
             total_widget_width_for_state(s),
             widget_height_for_state(s),
             s.placement_mode,
+            s.edge_collapse,
+            s.edge_expanded,
         )
     };
 
@@ -2594,7 +2767,7 @@ fn resize_widget_at_current_position(hwnd: HWND) {
 
     let rect = native_interop::get_window_rect_safe(hwnd);
     let work = work_area_rect();
-    let (x, y) = if let Some(rect) = rect {
+    let (mut x, y) = if let Some(rect) = rect {
         (
             rect.left.clamp(
                 work.left + sc(4),
@@ -2608,7 +2781,15 @@ fn resize_widget_at_current_position(hwnd: HWND) {
     } else {
         (work.right - width - sc(18), work.top + sc(18))
     };
+    if edge_collapse != EdgeCollapse::None {
+        x = if edge_expanded {
+            expanded_floating_x(edge_collapse, &work, width)
+        } else {
+            collapsed_floating_x(edge_collapse, &work, width)
+        };
+    }
     native_interop::move_window(hwnd, x, y, width, height);
+    ensure_floating_topmost(hwnd);
 }
 
 fn check_language_change() {
@@ -2768,6 +2949,7 @@ fn position_at_taskbar() {
             };
         }
         native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+        ensure_floating_topmost(hwnd);
         diagnose::log(format!(
             "positioned floating widget at x={x} y={y} w={widget_width} h={widget_height}"
         ));
@@ -3121,7 +3303,11 @@ unsafe extern "system" fn wnd_proc(
                         let desired_x = s.drag_start_floating_x + (pt.x - s.drag_start_mouse_x);
                         let desired_y = s.drag_start_floating_y + (pt.y - s.drag_start_mouse_y);
                         let work = work_area_rect();
-                        let edge = floating_edge_for_position(desired_x, full_width, &work);
+                        let edge = if s.floating_display_mode == FloatingDisplayMode::Bubble {
+                            EdgeCollapse::None
+                        } else {
+                            floating_edge_for_position(desired_x, full_width, &work)
+                        };
                         let widget_width = full_width;
                         let (mut new_x, new_y) = clamp_floating_position(
                             desired_x,
@@ -3310,6 +3496,13 @@ unsafe extern "system" fn wnd_proc(
             };
             if was_dragging.is_some() {
                 let _ = ReleaseCapture();
+                let placement_mode = {
+                    let state = lock_state();
+                    state.as_ref().map(|s| s.placement_mode)
+                };
+                if placement_mode == Some(PlacementMode::Floating) {
+                    ensure_floating_topmost(hwnd);
+                }
                 if should_track_leave {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
@@ -3459,6 +3652,27 @@ unsafe extern "system" fn wnd_proc(
                             }
                         }
                     }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
+                IDM_FLOATING_BUBBLE | IDM_FLOATING_BARS => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.floating_display_mode = if id == IDM_FLOATING_BUBBLE {
+                                FloatingDisplayMode::Bubble
+                            } else {
+                                FloatingDisplayMode::Bars
+                            };
+                            s.edge_animation = None;
+                            if s.floating_display_mode == FloatingDisplayMode::Bubble {
+                                s.edge_collapse = EdgeCollapse::None;
+                                s.edge_expanded = false;
+                            }
+                        }
+                    }
+                    let _ = KillTimer(hwnd, TIMER_EDGE_ANIMATION);
                     save_state_settings();
                     position_at_taskbar();
                     render_layered();
@@ -3707,8 +3921,7 @@ fn show_detail_panel(owner: HWND) {
         if let Some(s) = state.as_mut() {
             s.detail_visible = true;
             s.detail_mouse_down_seen = true;
-            s.edge_collapse = EdgeCollapse::None;
-            s.edge_expanded = false;
+            s.edge_expanded = s.edge_collapse != EdgeCollapse::None;
             s.edge_animation = None;
         }
     }
@@ -3925,19 +4138,30 @@ fn paint_detail_layered(hwnd: HWND, width: i32, height: i32) {
 }
 
 fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
-    let (items, is_dark, placement_mode, widget_theme, progress_color_mode, strings, hwnd) = {
+    let (
+        items,
+        summary,
+        placement_mode,
+        floating_display_mode,
+        widget_theme,
+        progress_color_mode,
+        strings,
+        hwnd,
+    ) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
             return;
         };
+        let codex = s.data.as_ref().and_then(|data| data.codex.as_ref());
         (
-            s.data
-                .as_ref()
-                .and_then(|data| data.codex.as_ref())
+            codex
                 .map(|codex| codex.account_details.clone())
                 .unwrap_or_default(),
-            s.is_dark,
+            codex
+                .filter(|codex| !codex.account_details.is_empty())
+                .map(usage_summary::summarize),
             s.placement_mode,
+            s.floating_display_mode,
             s.widget_theme,
             s.progress_color_mode,
             s.language.strings(),
@@ -3960,7 +4184,11 @@ fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
     } else {
         Color::from_hex("#667085")
     };
-    let row_bg = bg;
+    let summary_bg = if effective_dark {
+        Color::from_hex("#171D26")
+    } else {
+        Color::from_hex("#F6F8FA")
+    };
     let text = if effective_dark {
         Color::from_hex("#E7EDF5")
     } else {
@@ -4004,14 +4232,14 @@ fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
         let top = if placement_mode == PlacementMode::Fixed {
             sc(2)
         } else {
-            sc(FLOATING_WIDGET_HEIGHT) + sc(2)
+            main_widget_height_for_placement(placement_mode, floating_display_mode) + sc(2)
         };
         let hover_pt = detail_hover_point(hwnd);
         if items.is_empty() {
             let rect = RECT {
-                left: sc(8),
+                left: sc(3),
                 top,
-                right: width - sc(8),
+                right: width - sc(3),
                 bottom: height - sc(8),
             };
             draw_rounded_rect(hdc, &rect, &bg, sc(7));
@@ -4031,19 +4259,58 @@ fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             );
         } else {
-            for (idx, item) in items.iter().take(DETAIL_PANEL_MAX_ROWS).enumerate() {
-                let y = top + idx as i32 * sc(DETAIL_ROW_HEIGHT);
+            let visible_account_rows = items.len().min(DETAIL_PANEL_MAX_ACCOUNT_ROWS);
+            let visible_rows = 1 + visible_account_rows;
+            let panel_rect = RECT {
+                left: sc(3),
+                top,
+                right: width - sc(3),
+                bottom: top + visible_rows as i32 * sc(DETAIL_ROW_HEIGHT) - sc(6),
+            };
+            draw_rounded_rect(hdc, &panel_rect, &bg, sc(10));
+            draw_rounded_frame(hdc, &panel_rect, &border, sc(10));
+
+            if let Some(summary) = summary.as_ref() {
+                let summary_rect = RECT {
+                    left: panel_rect.left + sc(1),
+                    top: panel_rect.top + sc(1),
+                    right: panel_rect.right - sc(1),
+                    bottom: top + sc(DETAIL_ROW_HEIGHT) - sc(5),
+                };
+                draw_rounded_rect(hdc, &summary_rect, &summary_bg, sc(9));
+                draw_compact_summary_row(
+                    hdc,
+                    summary,
+                    sc(10),
+                    top,
+                    width - sc(20),
+                    strings,
+                    &text,
+                    &muted,
+                    &track,
+                    &accent,
+                    progress_color_mode,
+                    hover_pt,
+                );
+            }
+            for (idx, item) in items.iter().take(DETAIL_PANEL_MAX_ACCOUNT_ROWS).enumerate() {
+                let y = top + (idx as i32 + 1) * sc(DETAIL_ROW_HEIGHT);
+                let separator = RECT {
+                    left: panel_rect.left + sc(16),
+                    top: y,
+                    right: panel_rect.right - sc(16),
+                    bottom: y + sc(1),
+                };
+                let separator_brush = CreateSolidBrush(COLORREF(border.to_colorref()));
+                FillRect(hdc, &separator, separator_brush);
+                let _ = DeleteObject(separator_brush);
                 draw_compact_detail_row(
                     hdc,
                     item,
-                    sc(8),
+                    sc(10),
                     y,
-                    width - sc(16),
-                    sc(DETAIL_ROW_HEIGHT - 6),
-                    is_dark,
+                    width - sc(20),
                     strings,
-                    &row_bg,
-                    &border,
                     &text,
                     &muted,
                     &track,
@@ -4059,17 +4326,13 @@ fn paint_detail_panel(hdc: HDC, width: i32, height: i32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_compact_detail_row(
+fn draw_compact_summary_row(
     hdc: HDC,
-    item: &AccountUsageDetail,
+    summary: &UsageSummary,
     x: i32,
     y: i32,
     width: i32,
-    height: i32,
-    _is_dark: bool,
     strings: Strings,
-    row_bg: &Color,
-    border: &Color,
     text: &Color,
     muted: &Color,
     track: &Color,
@@ -4078,22 +4341,21 @@ fn draw_compact_detail_row(
     hover_pt: Option<POINT>,
 ) {
     unsafe {
-        let row_rect = RECT {
-            left: x,
-            top: y,
-            right: x + width,
-            bottom: y + height,
-        };
-        draw_rounded_rect(hdc, &row_rect, row_bg, sc(7));
-        draw_rounded_frame(hdc, &row_rect, border, sc(7));
-
-        let name = shorten_account_name(&item.name, item.id);
-        let mut name_wide = native_interop::wide_str(&name);
-        let mut name_rect = RECT {
+        let marker_rect = RECT {
             left: x + sc(10),
-            top: y + sc(7),
-            right: x + width - sc(12),
-            bottom: y + sc(26),
+            top: y + sc(11),
+            right: x + sc(13),
+            bottom: y + sc(27),
+        };
+        draw_rounded_rect(hdc, &marker_rect, accent, sc(1));
+
+        let mut name_wide =
+            native_interop::wide_str(&format!("整体汇总 · {} 个账号", summary.account_count));
+        let mut name_rect = RECT {
+            left: x + sc(20),
+            top: y + sc(8),
+            right: x + sc(192),
+            bottom: y + sc(30),
         };
         let _ = SetTextColor(hdc, COLORREF(text.to_colorref()));
         let _ = DrawTextW(
@@ -4102,16 +4364,15 @@ fn draw_compact_detail_row(
             &mut name_rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
+        draw_detail_column_headers(hdc, x + sc(12), x + width - sc(12), y + sc(8), muted);
 
-        draw_compact_usage_line(
+        draw_compact_summary_line(
             hdc,
             x + sc(12),
+            x + width - sc(12),
             y + sc(36),
             "5h",
-            item.session_requests,
-            item.session_tokens,
-            item.session_cost,
-            &item.session,
+            &summary.session,
             strings,
             text,
             muted,
@@ -4120,15 +4381,13 @@ fn draw_compact_detail_row(
             progress_color_mode,
             hover_pt,
         );
-        draw_compact_usage_line(
+        draw_compact_summary_line(
             hdc,
             x + sc(12),
-            y + sc(78),
+            x + width - sc(12),
+            y + sc(62),
             "7d",
-            item.weekly_requests,
-            item.weekly_tokens,
-            item.weekly_cost,
-            &item.weekly,
+            &summary.weekly,
             strings,
             text,
             muted,
@@ -4141,15 +4400,50 @@ fn draw_compact_detail_row(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_compact_usage_line(
+fn draw_compact_summary_line(
     hdc: HDC,
     x: i32,
+    right: i32,
     y: i32,
     label: &str,
-    requests: u64,
-    tokens: u64,
-    cost: f64,
-    section: &UsageSection,
+    summary: &UsageSummarySection,
+    strings: Strings,
+    text: &Color,
+    muted: &Color,
+    track: &Color,
+    accent: &Color,
+    progress_color_mode: ProgressColorMode,
+    hover_pt: Option<POINT>,
+) {
+    draw_compact_usage_line(
+        hdc,
+        x,
+        right,
+        y,
+        label,
+        summary.requests,
+        summary.tokens,
+        summary.used_cost,
+        &summary.usage,
+        true,
+        summary.total_quota,
+        strings,
+        text,
+        muted,
+        track,
+        accent,
+        progress_color_mode,
+        hover_pt,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_compact_detail_row(
+    hdc: HDC,
+    item: &AccountUsageDetail,
+    x: i32,
+    y: i32,
+    width: i32,
     strings: Strings,
     text: &Color,
     muted: &Color,
@@ -4159,12 +4453,149 @@ fn draw_compact_usage_line(
     hover_pt: Option<POINT>,
 ) {
     unsafe {
+        let name = shorten_account_name(&item.name, item.id);
+        let mut name_wide = native_interop::wide_str(&name);
+        let mut name_rect = RECT {
+            left: x + sc(12),
+            top: y + sc(8),
+            right: x + sc(192),
+            bottom: y + sc(30),
+        };
+        let _ = SetTextColor(hdc, COLORREF(text.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut name_wide,
+            &mut name_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        draw_detail_column_headers(hdc, x + sc(12), x + width - sc(12), y + sc(8), muted);
+
+        draw_compact_usage_line(
+            hdc,
+            x + sc(12),
+            x + width - sc(12),
+            y + sc(36),
+            "5h",
+            item.session_requests,
+            item.session_tokens,
+            item.session_cost,
+            &item.session,
+            true,
+            usage_summary::estimate_total_quota(item.session_cost, item.session.percentage),
+            strings,
+            text,
+            muted,
+            track,
+            accent,
+            progress_color_mode,
+            hover_pt,
+        );
+        draw_compact_usage_line(
+            hdc,
+            x + sc(12),
+            x + width - sc(12),
+            y + sc(62),
+            "7d",
+            item.weekly_requests,
+            item.weekly_tokens,
+            item.weekly_cost,
+            &item.weekly,
+            true,
+            usage_summary::estimate_total_quota(item.weekly_cost, item.weekly.percentage),
+            strings,
+            text,
+            muted,
+            track,
+            accent,
+            progress_color_mode,
+            hover_pt,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DetailColumns {
+    bar_left: i32,
+    usage_left: i32,
+    request_left: i32,
+    token_left: i32,
+    cost_left: i32,
+    right: i32,
+}
+
+fn detail_columns(x: i32, right: i32) -> DetailColumns {
+    let bar_left = x + sc(20);
+    let usage_left = bar_left + sc(79);
+    let request_left = usage_left + sc(81);
+    let metric_width = (right - request_left).max(0) / 3;
+    let token_left = request_left + metric_width;
+    let cost_left = token_left + metric_width;
+    DetailColumns {
+        bar_left,
+        usage_left,
+        request_left,
+        token_left,
+        cost_left,
+        right,
+    }
+}
+
+fn draw_detail_column_headers(hdc: HDC, x: i32, right: i32, y: i32, muted: &Color) {
+    unsafe {
+        let columns = detail_columns(x, right);
+        let headers = [
+            ("请求", columns.request_left, columns.token_left),
+            ("Token", columns.token_left, columns.cost_left),
+            ("额度", columns.cost_left, columns.right),
+        ];
+        let _ = SetTextColor(hdc, COLORREF(muted.to_colorref()));
+        for (label, left, right) in headers {
+            let mut wide = native_interop::wide_str(label);
+            let mut rect = RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + sc(22),
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut wide,
+                &mut rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_compact_usage_line(
+    hdc: HDC,
+    x: i32,
+    right: i32,
+    y: i32,
+    label: &str,
+    requests: u64,
+    tokens: u64,
+    cost: f64,
+    section: &UsageSection,
+    show_total_quota: bool,
+    total_quota: Option<f64>,
+    strings: Strings,
+    text: &Color,
+    muted: &Color,
+    track: &Color,
+    accent: &Color,
+    progress_color_mode: ProgressColorMode,
+    hover_pt: Option<POINT>,
+) {
+    unsafe {
+        let columns = detail_columns(x, right);
         let mut label_wide = native_interop::wide_str(label);
         let mut label_rect = RECT {
             left: x,
-            top: y + sc(18),
-            right: x + sc(24),
-            bottom: y + sc(33),
+            top: y,
+            right: columns.bar_left,
+            bottom: y + sc(18),
         };
         let _ = SetTextColor(hdc, COLORREF(muted.to_colorref()));
         let _ = DrawTextW(
@@ -4174,48 +4605,48 @@ fn draw_compact_usage_line(
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
 
-        let bar_x = x + sc(27);
-        let segment_count = SEGMENT_COUNT;
-        let seg_w = sc(SEGMENT_W);
+        let bar_x = columns.bar_left;
+        let segment_count = 8;
+        let seg_w = sc(7);
         let seg_h = sc(12);
-        let seg_gap = sc(SEGMENT_GAP);
-        let stats_bg = if track.r < 80 {
-            Color::from_hex("#202734")
-        } else {
-            Color::from_hex("#EEF1F5")
-        };
-        let stats = detail_stat_values(requests, tokens, cost);
-        let pill_widths = [
-            detail_pill_width(&stats[0], 46, 70),
-            detail_pill_width(&stats[1], 44, 76),
-            detail_pill_width(&stats[2], 48, 80),
+        let seg_gap = sc(1);
+        let stats = detail_stat_values(requests, tokens, cost, show_total_quota, total_quota);
+        let metric_rects = [
+            RECT {
+                left: columns.request_left,
+                top: y,
+                right: columns.token_left,
+                bottom: y + sc(18),
+            },
+            RECT {
+                left: columns.token_left,
+                top: y,
+                right: columns.cost_left,
+                bottom: y + sc(18),
+            },
+            RECT {
+                left: columns.cost_left,
+                top: y,
+                right: columns.right,
+                bottom: y + sc(18),
+            },
         ];
-        let pill_gap = sc(4);
-        let pill_h = sc(18);
-        let pill_y = y;
-        let mut pill_x = bar_x;
-        let stat_labels = ["请求数", "Token数", "统计额度"];
+        let stat_labels = ["请求数", "Token数", "当前额度 / 总额度"];
         let mut tooltip: Option<(RECT, &str)> = None;
         for (idx, value) in stats.iter().enumerate() {
-            let pill_rect = RECT {
-                left: pill_x,
-                top: pill_y,
-                right: pill_x + pill_widths[idx],
-                bottom: pill_y + pill_h,
-            };
-            draw_rounded_rect(hdc, &pill_rect, &stats_bg, sc(8));
+            let metric_rect = metric_rects[idx];
             let is_hovered = hover_pt
-                .map(|pt| point_in_rect(pt, &pill_rect))
+                .map(|pt| point_in_rect(pt, &metric_rect))
                 .unwrap_or(false);
             if is_hovered {
-                tooltip = Some((pill_rect, stat_labels[idx]));
+                tooltip = Some((metric_rect, stat_labels[idx]));
             }
             let mut stats_wide = native_interop::wide_str(value);
             let mut stats_rect = RECT {
-                left: pill_rect.left + sc(4),
-                top: pill_rect.top,
-                right: pill_rect.right - sc(4),
-                bottom: pill_rect.bottom,
+                left: metric_rect.left,
+                top: metric_rect.top,
+                right: metric_rect.right,
+                bottom: metric_rect.bottom,
             };
             let _ = SetTextColor(hdc, COLORREF(muted.to_colorref()));
             let _ = DrawTextW(
@@ -4224,12 +4655,7 @@ fn draw_compact_usage_line(
                 &mut stats_rect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             );
-            pill_x += pill_widths[idx] + pill_gap;
         }
-        if let Some((pill_rect, tip)) = tooltip {
-            draw_detail_tip(hdc, &pill_rect, tip, text);
-        }
-
         let fill = progress_fill_color(
             section.percentage.clamp(0.0, 100.0),
             accent,
@@ -4243,9 +4669,9 @@ fn draw_compact_usage_line(
             let seg_end = seg_start + segment_percent;
             let rect = RECT {
                 left: seg_x,
-                top: y + sc(21),
+                top: y + sc(3),
                 right: seg_x + seg_w,
-                bottom: y + sc(21) + seg_h,
+                bottom: y + sc(3) + seg_h,
             };
             if percent >= seg_end {
                 draw_rounded_rect(hdc, &rect, &fill, sc(2));
@@ -4258,9 +4684,9 @@ fn draw_compact_usage_line(
                 if fill_width > 0 {
                     let fill_rect = RECT {
                         left: seg_x,
-                        top: y + sc(21),
+                        top: y + sc(3),
                         right: seg_x + fill_width,
-                        bottom: y + sc(21) + seg_h,
+                        bottom: y + sc(3) + seg_h,
                     };
                     let rgn = CreateRoundRectRgn(
                         rect.left,
@@ -4283,10 +4709,10 @@ fn draw_compact_usage_line(
         let line = poller::format_line(section, strings);
         let mut line_wide = native_interop::wide_str(&line);
         let mut line_rect = RECT {
-            left: bar_x + segment_count * (seg_w + seg_gap) + sc(5),
-            top: y + sc(20),
-            right: x + sc(272),
-            bottom: y + sc(36),
+            left: columns.usage_left,
+            top: y,
+            right: columns.request_left,
+            bottom: y + sc(18),
         };
         let _ = SetTextColor(hdc, COLORREF(text.to_colorref()));
         let _ = DrawTextW(
@@ -4295,6 +4721,9 @@ fn draw_compact_usage_line(
             &mut line_rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
+        if let Some((metric_rect, tip)) = tooltip {
+            draw_detail_tip(hdc, &metric_rect, tip, text);
+        }
     }
 }
 
@@ -4313,26 +4742,11 @@ fn point_in_rect(pt: POINT, rect: &RECT) -> bool {
     pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom
 }
 
-fn detail_pill_width(value: &str, min_width: i32, max_width: i32) -> i32 {
-    let mut rough = 14;
-    for ch in value.chars() {
-        rough += match ch {
-            '0'..='9' => 7,
-            '.' | ',' => 4,
-            '$' => 7,
-            ' ' => 4,
-            'K' | 'M' | 'B' | 'r' | 'A' | 'U' => 8,
-            'a'..='z' => 6,
-            _ => 7,
-        };
-    }
-    sc(rough.clamp(min_width, max_width))
-}
-
 fn draw_detail_tip(hdc: HDC, anchor: &RECT, text: &str, text_color: &Color) {
     unsafe {
         let tip_w = match text {
-            "统计额度" => sc(66),
+            "当前额度 / 总额度" => sc(112),
+            "已用额度" => sc(66),
             "Token数" => sc(56),
             _ => sc(50),
         };
@@ -4367,12 +4781,23 @@ fn draw_detail_tip(hdc: HDC, anchor: &RECT, text: &str, text_color: &Color) {
     }
 }
 
-fn detail_stat_values(requests: u64, tokens: u64, cost: f64) -> [String; 3] {
-    [
-        format!("{} req", compact_number(requests)),
-        format!("U {}", compact_number(tokens)),
-        format!("A ${:.1}", cost.max(0.0)),
-    ]
+fn detail_stat_values(
+    requests: u64,
+    tokens: u64,
+    cost: f64,
+    show_total_quota: bool,
+    total_quota: Option<f64>,
+) -> [String; 3] {
+    let cost = cost.max(0.0);
+    let cost_text = if show_total_quota {
+        match total_quota {
+            Some(quota) => format!("${cost:.1} / ${:.1}", quota.max(cost)),
+            None => format!("${cost:.1} / --"),
+        }
+    } else {
+        format!("${cost:.1}")
+    };
+    [compact_number(requests), compact_number(tokens), cost_text]
 }
 
 fn compact_number(value: u64) -> String {
@@ -4409,6 +4834,7 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             show_codex,
             placement_mode,
+            floating_display_mode,
             widget_theme,
             progress_color_mode,
             sub2api_groups,
@@ -4430,6 +4856,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.show_codex,
                     s.placement_mode,
+                    s.floating_display_mode,
                     s.widget_theme,
                     s.progress_color_mode,
                     s.sub2api_groups.clone(),
@@ -4448,6 +4875,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     false,
                     PlacementMode::Fixed,
+                    FloatingDisplayMode::Bubble,
                     WidgetTheme::Dark,
                     ProgressColorMode::Mono,
                     Vec::new(),
@@ -4617,6 +5045,37 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             placement_menu.0 as usize,
             PCWSTR::from_raw(placement_label.as_ptr()),
+        );
+
+        let floating_style_menu = CreatePopupMenu().unwrap();
+        let bubble_label = native_interop::wide_str("圆球（默认）");
+        let bars_label = native_interop::wide_str("用量条");
+        let _ = AppendMenuW(
+            floating_style_menu,
+            if floating_display_mode == FloatingDisplayMode::Bubble {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_FLOATING_BUBBLE as usize,
+            PCWSTR::from_raw(bubble_label.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            floating_style_menu,
+            if floating_display_mode == FloatingDisplayMode::Bars {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_FLOATING_BARS as usize,
+            PCWSTR::from_raw(bars_label.as_ptr()),
+        );
+        let floating_style_label = native_interop::wide_str("浮窗样式");
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            floating_style_menu.0 as usize,
+            PCWSTR::from_raw(floating_style_label.as_ptr()),
         );
 
         let theme_menu = CreatePopupMenu().unwrap();
@@ -4830,6 +5289,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         placement_mode,
+        floating_display_mode,
         widget_theme,
         progress_color_mode,
         edge_collapse,
@@ -4851,6 +5311,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_claude_code,
                 s.show_codex,
                 s.placement_mode,
+                s.floating_display_mode,
                 s.widget_theme,
                 s.progress_color_mode,
                 s.edge_collapse,
@@ -4928,6 +5389,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_claude_code,
             show_codex,
             placement_mode,
+            floating_display_mode,
             progress_color_mode,
             if edge_expanded {
                 EdgeCollapse::None
@@ -4935,6 +5397,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 edge_collapse
             },
             &codex_accent,
+            false,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -5162,5 +5625,23 @@ fn draw_rounded_frame(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         SelectObject(hdc, old_brush);
         SelectObject(hdc, old_pen);
         let _ = DeleteObject(pen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_settings_default_to_floating_bubble() {
+        let settings = SettingsFile::default();
+        assert_eq!(settings.placement_mode, PlacementMode::Floating);
+        assert_eq!(settings.floating_display_mode, FloatingDisplayMode::Bubble);
+    }
+
+    #[test]
+    fn legacy_settings_without_display_mode_use_bubble() {
+        let settings: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.floating_display_mode, FloatingDisplayMode::Bubble);
     }
 }
