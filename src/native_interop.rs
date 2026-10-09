@@ -19,6 +19,7 @@ pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
 pub const TIMER_EDGE_ANIMATION: usize = 5;
+pub const TIMER_PET_RENDER: usize = 8;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
