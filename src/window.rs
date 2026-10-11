@@ -1065,9 +1065,9 @@ const FLOATING_EDGE_SNAP_DISTANCE: i32 = 28;
 const FLOATING_COLLAPSED_VISIBLE_WIDTH: i32 = 88;
 const PET_SCENE_MAX_WIDTH: i32 = 220;
 const PET_TRANSITION_MS: u128 = 300;
-const PET_FRAME_MS: u128 = 360;
+const PET_FRAME_MS: u128 = 120;
 const PET_ACTION_CHECK_MS: u128 = 24_000;
-const PET_ACTION_FRAME_COUNT: usize = 18;
+const PET_ACTION_FRAME_COUNT: usize = crate::pixel_room::ACTION_FRAMES;
 const PET_ACTION_CHANCE_PERCENT: u64 = 14;
 
 fn pet_random_seed() -> u64 {
@@ -1122,7 +1122,8 @@ fn pet_frame_for_state(state: &AppState) -> usize {
         return 0;
     }
     let elapsed = state.pet_animation_started.elapsed().as_millis();
-    let idle_frame = (elapsed / PET_FRAME_MS % 3) as usize;
+    let idle_frame =
+        (elapsed / (PET_FRAME_MS * 3) % crate::pixel_room::IDLE_FRAMES as u128) as usize;
     let cycle = elapsed / PET_ACTION_CHECK_MS;
     let cycle_elapsed = elapsed % PET_ACTION_CHECK_MS;
     let action_duration = PET_FRAME_MS * PET_ACTION_FRAME_COUNT as u128;
@@ -1130,7 +1131,7 @@ fn pet_frame_for_state(state: &AppState) -> usize {
     if cycle_elapsed < action_duration && roll % 100 < PET_ACTION_CHANCE_PERCENT {
         let action_kind = ((roll / 100) % 3) as usize;
         let action_frame = (cycle_elapsed / PET_FRAME_MS) as usize;
-        return 3
+        return crate::pixel_room::IDLE_FRAMES
             + action_kind * PET_ACTION_FRAME_COUNT
             + action_frame.min(PET_ACTION_FRAME_COUNT - 1);
     }
@@ -2062,48 +2063,6 @@ fn pet_scene_rect(width: i32, height: i32, show_claude_code: bool, show_codex: b
     }
 }
 
-fn pet_scene_palette() -> (Color, Color, Color, Color, Color, u8) {
-    let hour = std::env::var("CLAUDE_USAGE_MONITOR_PET_PREVIEW_HOUR")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .filter(|hour| *hour < 24)
-        .unwrap_or_else(|| unsafe { GetLocalTime().wHour });
-    match hour {
-        5..=8 => (
-            Color::new(183, 205, 224),
-            Color::new(255, 204, 157),
-            Color::new(235, 237, 238),
-            Color::new(198, 202, 208),
-            Color::new(255, 239, 218),
-            0,
-        ),
-        9..=16 => (
-            Color::new(169, 213, 234),
-            Color::new(255, 232, 156),
-            Color::new(232, 238, 242),
-            Color::new(190, 199, 209),
-            Color::new(247, 250, 252),
-            1,
-        ),
-        17..=19 => (
-            Color::new(226, 157, 131),
-            Color::new(255, 207, 122),
-            Color::new(235, 221, 215),
-            Color::new(200, 181, 172),
-            Color::new(255, 233, 207),
-            2,
-        ),
-        _ => (
-            Color::new(37, 52, 78),
-            Color::new(255, 252, 231),
-            Color::new(220, 226, 235),
-            Color::new(183, 193, 207),
-            Color::new(216, 228, 245),
-            3,
-        ),
-    }
-}
-
 fn draw_pet_scene(
     hdc: HDC,
     width: i32,
@@ -2116,431 +2075,65 @@ fn draw_pet_scene(
     if reveal <= 0.0 {
         return;
     }
-
     let rect = pet_scene_rect(width, height, show_claude_code, show_codex);
     let scene_width = rect.right - rect.left;
     let scene_height = rect.bottom - rect.top;
     if scene_width <= 0 || scene_height <= 0 {
         return;
     }
-
+    let hour = std::env::var("CLAUDE_USAGE_MONITOR_PET_PREVIEW_HOUR")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|hour| *hour < 24)
+        .unwrap_or_else(|| unsafe { GetLocalTime().wHour });
+    let pixels = crate::pixel_room::render(hour, frame);
+    let scale = (scene_width as f64 / crate::pixel_room::WIDTH as f64)
+        .min(scene_height as f64 / crate::pixel_room::HEIGHT as f64);
+    let art_width = (crate::pixel_room::WIDTH as f64 * scale).round() as i32;
+    let art_height = (crate::pixel_room::HEIGHT as f64 * scale).round() as i32;
+    let x = rect.left + (scene_width - art_width) / 2;
+    let y = rect.top + (scene_height - art_height) / 2;
     let reveal_width = (scene_width as f64 * reveal.clamp(0.0, 1.0)).round() as i32;
-    if reveal_width <= 0 {
-        return;
-    }
-
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: crate::pixel_room::WIDTH as i32,
+            biHeight: -(crate::pixel_room::HEIGHT as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     unsafe {
         let saved = SaveDC(hdc);
-        let clip_left = rect.right - reveal_width;
-        let _ = IntersectClipRect(hdc, clip_left, rect.top, rect.right, rect.bottom);
-
-        let white = CreateSolidBrush(COLORREF(native_interop::colorref(255, 255, 255)));
-        let _ = FillRect(hdc, &rect, white);
-        let _ = DeleteObject(white);
-
-        // Keep the room crisp at every DPI while using the full empty header area.
-        let cell = (scene_width / 108).min(scene_height / 24).max(sc(1));
-        let art_width = cell * 108;
-        let art_height = cell * 24;
-        let origin_x = rect.left + (scene_width - art_width) / 2;
-        let origin_y = rect.top + (scene_height - art_height) / 2;
-        let (sky, glow, floor, shadow, highlight, time_mode) = pet_scene_palette();
-        let idle_frame = if frame < 3 {
-            frame
-        } else {
-            ((frame - 3) / 3) % 3
-        };
-        let outline = Color::new(43, 45, 50);
-        let fur = Color::new(232, 234, 230);
-        let cream = Color::new(250, 250, 243);
-        let patch = Color::new(31, 33, 39);
-        let warm_patch = Color::new(194, 111, 73);
-        let muzzle = Color::new(255, 255, 249);
-        let window_frame = Color::new(190, 198, 207);
-        let curtain = Color::new(231, 163, 157);
-        let curtain_shadow = Color::new(203, 125, 128);
-        let curtain_highlight = Color::new(247, 195, 179);
-        let tieback = Color::new(174, 109, 104);
-        let nest_outline = Color::new(104, 74, 67);
-        let nest_outer = Color::new(182, 122, 98);
-        let nest_mid = Color::new(213, 157, 120);
-        let nest_light = Color::new(244, 204, 158);
-        let nest_shadow = Color::new(145, 91, 79);
-        let cat_shadow = Color::new(178, 182, 184);
-        let room_line = Color::new(232, 235, 238);
-        let desk_outline = Color::new(87, 72, 68);
-        let desk_top = Color::new(177, 126, 99);
-        let desk_front = Color::new(139, 92, 78);
-        let desk_shadow = Color::new(122, 85, 72);
-        let monitor_back = Color::new(7, 12, 10);
-        let monitor_edge = Color::new(56, 62, 70);
-        let monitor_shell = Color::new(115, 126, 133);
-        let monitor_bar = Color::new(16, 29, 21);
-        let code_line = Color::new(105, 224, 120);
-        let code_cursor = Color::new(170, 255, 161);
-        let human_hair = Color::new(48, 48, 55);
-        let hair_highlight = Color::new(92, 75, 75);
-        let human_shirt = Color::new(88, 119, 139);
-        let human_shirt_light = Color::new(137, 163, 174);
-        let human_shirt_shadow = Color::new(58, 79, 96);
-        let human_shadow = Color::new(48, 65, 82);
-        let skin = Color::new(235, 178, 137);
-        let human_pants = Color::new(83, 103, 119);
-        let human_pants_light = Color::new(132, 151, 158);
-        let shoe = Color::new(54, 49, 56);
-        let shoe_highlight = Color::new(111, 96, 96);
-        let stool_outline = Color::new(108, 68, 53);
-        let stool_seat = Color::new(207, 149, 99);
-        let stool_shadow = Color::new(145, 91, 68);
-        let stool_leg = Color::new(126, 80, 59);
-        let stool_foot = Color::new(82, 66, 62);
-        let lamp_outline = Color::new(95, 74, 61);
-        let lamp_glow = Color::new(255, 226, 139);
-        let lamp_highlight = Color::new(255, 246, 194);
-        let window_light = match time_mode {
-            0 => Color::new(255, 224, 148),
-            1 => Color::new(255, 235, 167),
-            2 => Color::new(247, 158, 87),
-            _ => Color::new(0, 0, 0),
-        };
-        let cabinet_outline = Color::new(103, 79, 69);
-        let cabinet_face = Color::new(205, 161, 116);
-        let cabinet_shadow = Color::new(168, 119, 92);
-        let cabinet_handle = Color::new(116, 83, 65);
-        let plant_leaf = Color::new(93, 139, 105);
-        let plant_dark = Color::new(58, 101, 78);
-        let tree_outline = Color::new(91, 70, 62);
-        let tree_post = Color::new(185, 133, 89);
-        let tree_platform = Color::new(216, 173, 119);
-        let bowl_outline = Color::new(91, 76, 78);
-        let bowl_fill = Color::new(125, 168, 181);
-
-        let fill_cell = |x: i32, y: i32, width: i32, height: i32, color: Color| {
-            let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
-            let block = RECT {
-                left: origin_x + x * cell,
-                top: origin_y + y * cell,
-                right: origin_x + (x + width) * cell,
-                bottom: origin_y + (y + height) * cell,
-            };
-            let _ = FillRect(hdc, &block, brush);
-            let _ = DeleteObject(brush);
-        };
-
-        // The room is built left-to-right: coder, cabinet, window, cat furniture.
-        fill_cell(0, 18, 108, 1, room_line);
-
-        // Window, panes, curtains, and a small changing sky.
-        fill_cell(54, 2, 24, 13, window_frame);
-        fill_cell(55, 3, 22, 11, sky);
-        fill_cell(65, 3, 1, 11, window_frame);
-        fill_cell(55, 8, 22, 1, window_frame);
-        fill_cell(55, 3, 22, 1, highlight);
-        fill_cell(69, 5, 2, 1, highlight);
-        fill_cell(73, 7, 1, 1, highlight);
-
-        if time_mode == 3 {
-            // A small white moon and sparse stars mark the night state.
-            fill_cell(70, 4, 2, 1, glow);
-            fill_cell(69, 5, 4, 2, glow);
-            fill_cell(70, 7, 2, 1, glow);
-            fill_cell(59, 5, 1, 1, highlight);
-            fill_cell(74, 4, 1, 1, highlight);
-            fill_cell(61, 7, 1, 1, highlight);
-        } else if time_mode == 2 {
-            fill_cell(59, 8, 5, 1, glow);
-            fill_cell(70, 6, 3, 1, highlight);
-        } else if time_mode == 0 {
-            fill_cell(59, 5, 4, 2, glow);
-            fill_cell(70, 6, 3, 1, highlight);
-        } else {
-            fill_cell(59, 4, 5, 3, glow);
-            fill_cell(67, 6, 4, 1, highlight);
-            fill_cell(70, 7, 3, 1, highlight);
+        if saved == 0 {
+            return;
         }
-
-        // The upper folds stay anchored while the lower panels follow a slow breeze.
-        let curtain_sway = match idle_frame {
-            0 => 0,
-            1 => 2,
-            _ => 1,
-        };
-        let left_curtain_x = 51 + curtain_sway;
-        let right_curtain_x = 76 + curtain_sway;
-        fill_cell(51, 2, 6, 8, curtain);
-        fill_cell(51, 2, 2, 8, curtain_shadow);
-        fill_cell(53, 2, 1, 8, curtain_highlight);
-        fill_cell(55, 2, 1, 8, curtain_highlight);
-        fill_cell(left_curtain_x, 10, 5, 4, curtain);
-        fill_cell(left_curtain_x + 1, 10, 1, 4, curtain_highlight);
-        fill_cell(left_curtain_x + 3, 10, 1, 4, curtain_shadow);
-        fill_cell(left_curtain_x, 14, 5, 2, curtain_shadow);
-        fill_cell(left_curtain_x + 1, 16, 4, 1, curtain_shadow);
-        fill_cell(left_curtain_x + 2, 14, 1, 2, curtain_highlight);
-        fill_cell(76, 2, 6, 8, curtain);
-        fill_cell(80, 2, 2, 8, curtain_shadow);
-        fill_cell(78, 2, 1, 8, curtain_highlight);
-        fill_cell(77, 2, 1, 8, curtain_highlight);
-        fill_cell(right_curtain_x, 10, 5, 4, curtain);
-        fill_cell(right_curtain_x + 1, 10, 1, 4, curtain_highlight);
-        fill_cell(right_curtain_x + 3, 10, 1, 4, curtain_shadow);
-        fill_cell(right_curtain_x, 14, 5, 2, curtain_shadow);
-        fill_cell(right_curtain_x + 1, 16, 4, 1, curtain_shadow);
-        fill_cell(right_curtain_x + 2, 14, 1, 2, curtain_highlight);
-        fill_cell(55, 10, 2, 1, tieback);
-        fill_cell(75, 10, 2, 1, tieback);
-
-        // A compact cabinet with drawers and a plant fills the vertical gap.
-        fill_cell(36, 5, 11, 16, cabinet_outline);
-        fill_cell(38, 6, 7, 14, cabinet_face);
-        fill_cell(38, 11, 7, 1, cabinet_shadow);
-        fill_cell(38, 16, 7, 1, cabinet_shadow);
-        fill_cell(40, 9, 2, 1, cabinet_handle);
-        fill_cell(40, 14, 2, 1, cabinet_handle);
-        fill_cell(39, 4, 6, 1, cabinet_shadow);
-        fill_cell(40, 2, 1, 2, plant_dark);
-        fill_cell(38, 3, 2, 2, plant_leaf);
-        fill_cell(41, 2, 2, 2, plant_leaf);
-        fill_cell(44, 3, 2, 2, plant_dark);
-
-        fill_cell(0, 20, 108, 1, floor);
-        fill_cell(7, 22, 18, 1, floor);
-        fill_cell(30, 22, 18, 1, floor);
-        fill_cell(55, 22, 18, 1, floor);
-        fill_cell(80, 22, 18, 1, floor);
-        fill_cell(79, 21, 13, 1, shadow);
-
-        // Four quiet window-pane reflections rest on the floor during daylight.
-        if time_mode != 3 {
-            fill_cell(43, 20, 5, 1, window_light);
-            fill_cell(50, 21, 5, 1, window_light);
-            fill_cell(58, 20, 5, 1, window_light);
-            fill_cell(65, 21, 5, 1, window_light);
-        }
-
-        // Desk and monitor, viewed from behind the seated coder.
-        fill_cell(2, 16, 31, 2, desk_outline);
-        fill_cell(3, 16, 29, 1, desk_top);
-        fill_cell(4, 18, 2, 5, desk_front);
-        fill_cell(29, 18, 2, 5, desk_front);
-
-        // A small editor window makes the computer read as an active coding session.
-        fill_cell(17, 6, 16, 10, monitor_edge);
-        fill_cell(18, 7, 14, 8, monitor_shell);
-        fill_cell(19, 8, 12, 6, monitor_back);
-        fill_cell(19, 8, 12, 1, monitor_bar);
-        // One green line slowly reveals from left to right on a black screen.
-        fill_cell(20, 8, 1, 1, code_line);
-        let code_progress = match idle_frame {
-            0 => 2,
-            1 => 5,
-            _ => 8,
-        };
-        fill_cell(21, 10, code_progress, 1, code_line);
-        fill_cell(21 + code_progress, 10, 1, 1, code_cursor);
-        fill_cell(23, 15, 3, 1, monitor_edge);
-        fill_cell(17, 16, 12, 1, desk_shadow);
-        fill_cell(18, 15, 9, 1, Color::new(225, 216, 196));
-
-        if time_mode == 3 {
-            // The desk lamp turns on only at night and keeps the coder readable.
-            fill_cell(2, 11, 5, 1, lamp_outline);
-            fill_cell(3, 10, 3, 1, lamp_outline);
-            fill_cell(3, 11, 3, 2, lamp_glow);
-            fill_cell(4, 13, 1, 3, lamp_outline);
-            fill_cell(3, 12, 3, 1, lamp_highlight);
-        }
-
-        // A wooden stool sits below the coder, with visible seat, legs, and feet.
-        fill_cell(7, 18, 12, 2, stool_outline);
-        fill_cell(8, 18, 10, 1, stool_seat);
-        fill_cell(8, 19, 10, 1, stool_shadow);
-        fill_cell(7, 20, 2, 3, stool_leg);
-        fill_cell(18, 20, 2, 3, stool_leg);
-        fill_cell(6, 22, 4, 1, stool_foot);
-        fill_cell(18, 22, 4, 1, stool_foot);
-
-        // Head, shoulders, and arms reaching the keyboard.
-        fill_cell(9, 15, 10, 4, human_shadow);
-        fill_cell(10, 15, 8, 3, human_shirt);
-        fill_cell(11, 15, 6, 1, human_shirt_light);
-        fill_cell(10, 18, 8, 2, human_shirt_shadow);
-        fill_cell(9, 10, 8, 5, human_hair);
-        fill_cell(10, 9, 6, 1, human_hair);
-        fill_cell(11, 9, 4, 1, hair_highlight);
-        fill_cell(10, 11, 1, 3, hair_highlight);
-        fill_cell(15, 11, 2, 3, hair_highlight);
-        fill_cell(12, 14, 3, 2, skin);
-        fill_cell(13, 14, 2, 1, hair_highlight);
-        let typing_offset = if idle_frame == 1 { 1 } else { 0 };
-        fill_cell(16, 16, 4 + typing_offset, 1, human_shirt_light);
-        fill_cell(17, 17, 5, 1, human_shirt_shadow);
-        fill_cell(20 + typing_offset, 16, 2, 1, skin);
-        fill_cell(21 + typing_offset, 15, 2, 1, skin);
-        fill_cell(if idle_frame == 2 { 25 } else { 23 }, 15, 1, 1, code_cursor);
-        fill_cell(11, 18, 7, 2, human_pants);
-        fill_cell(12, 18, 3, 1, human_pants_light);
-        fill_cell(15, 18, 3, 1, human_pants_light);
-        fill_cell(11, 20, 3, 2, human_pants);
-        fill_cell(15, 20, 3, 2, human_pants);
-        fill_cell(14, 20, 1, 2, floor);
-        fill_cell(10, 22, 4, 1, shoe);
-        fill_cell(15, 22, 4, 1, shoe);
-        fill_cell(11, 22, 2, 1, shoe_highlight);
-        fill_cell(16, 22, 2, 1, shoe_highlight);
-
-        // A small cat tree adds vertical texture beside the nest.
-        fill_cell(85, 8, 3, 14, tree_outline);
-        fill_cell(86, 9, 1, 12, tree_post);
-        fill_cell(83, 8, 8, 2, tree_outline);
-        fill_cell(84, 9, 6, 1, tree_platform);
-        fill_cell(84, 5, 7, 2, tree_outline);
-        fill_cell(86, 6, 4, 1, tree_platform);
-        fill_cell(87, 3, 3, 2, tree_outline);
-        fill_cell(88, 4, 1, 1, tree_platform);
-        fill_cell(87, 12, 4, 2, tree_outline);
-        fill_cell(88, 13, 2, 1, tree_platform);
-        fill_cell(90, 15, 1, 3, tree_post);
-
-        // Food bowl on the floor between the tree and the sleeping cat.
-        fill_cell(92, 19, 4, 3, bowl_outline);
-        fill_cell(93, 19, 2, 1, bowl_fill);
-        fill_cell(93, 20, 2, 1, Color::new(191, 218, 221));
-
-        // Layered nest: dark outer rim, raised cushion, then a front lip over the cat.
-        fill_cell(97, 16, 11, 7, nest_outline);
-        fill_cell(99, 16, 8, 4, nest_outer);
-        fill_cell(100, 15, 6, 2, nest_light);
-        fill_cell(99, 17, 8, 2, nest_mid);
-        fill_cell(100, 18, 6, 1, nest_light);
-        fill_cell(98, 19, 9, 3, nest_shadow);
-
-        let draw_cat = |x: i32, y: i32, pose: u8, step: usize| {
-            let tail_shift = if step % 2 == 1 { 1 } else { 0 };
-
-            // Black-and-white body, a small orange patch, and separate feet.
-            fill_cell(x + 3, y, 5, 5, outline);
-            fill_cell(x, y + 1, 5, 5, outline);
-            fill_cell(x + 1, y - 1, 2, 2, outline);
-            fill_cell(x + 4, y - 1, 2, 2, outline);
-            fill_cell(x + 7 + tail_shift, y + 1, 3, 1, outline);
-            fill_cell(x + 9 + tail_shift, y, 1, 3, outline);
-
-            fill_cell(x + 4, y + 1, 3, 3, fur);
-            fill_cell(x + 3, y + 1, 1, 2, patch);
-            fill_cell(x + 6, y + 3, 2, 2, patch);
-            fill_cell(x + 5, y + 1, 1, 2, warm_patch);
-            fill_cell(x + 1, y + 2, 3, 3, cream);
-            fill_cell(x + 1, y + 2, 1, 2, patch);
-            fill_cell(x + 3, y + 2, 1, 1, outline);
-            fill_cell(x + 2, y + 4, 2, 1, muzzle);
-            fill_cell(x + 1, y + 4, 1, 1, outline);
-
-            if pose == 0 {
-                fill_cell(x + 4, y + 4, 2, 1, cat_shadow);
-            } else {
-                fill_cell(x + 3, y + 5, 2, 2, outline);
-                fill_cell(x + 6, y + 5, 2, 2, outline);
-                if pose == 1 {
-                    if step % 2 == 0 {
-                        fill_cell(x + 2, y + 6, 2, 1, cream);
-                        fill_cell(x + 7, y + 5, 2, 1, cream);
-                    } else {
-                        fill_cell(x + 2, y + 5, 2, 1, cream);
-                        fill_cell(x + 7, y + 6, 2, 1, cream);
-                    }
-                } else {
-                    fill_cell(x + 3, y + 6, 2, 1, cream);
-                    fill_cell(x + 6, y + 6, 2, 1, cream);
-                }
-            }
-
-            if pose == 3 {
-                // Raised paw: the desk action reads as scratching instead of standing.
-                fill_cell(x + 7, y - 2, 2, 3, outline);
-                fill_cell(x + 8, y - 3, 1, 2, cream);
-            } else if pose == 4 {
-                // Spread feet and lifted paws make the jump frame readable.
-                fill_cell(x + 1, y + 5, 2, 2, outline);
-                fill_cell(x + 7, y + 5, 2, 2, outline);
-            }
-        };
-
-        let action_code = frame.checked_sub(3);
-        if let Some(action_code) = action_code {
-            let action_kind = action_code / PET_ACTION_FRAME_COUNT;
-            let action_frame = action_code % PET_ACTION_FRAME_COUNT;
-            match action_kind {
-                0 => match action_frame {
-                    0 => draw_cat(98, 14, 1, action_frame),
-                    1 => draw_cat(94, 14, 1, action_frame),
-                    2 => draw_cat(90, 14, 1, action_frame),
-                    3 => draw_cat(86, 14, 1, action_frame),
-                    4 => draw_cat(82, 8, 4, action_frame),
-                    5 => draw_cat(74, 14, 1, action_frame),
-                    6 => draw_cat(66, 14, 1, action_frame),
-                    7 => draw_cat(58, 14, 1, action_frame),
-                    8 => draw_cat(50, 14, 1, action_frame),
-                    9 => draw_cat(42, 14, 1, action_frame),
-                    10 => draw_cat(34, 14, 1, action_frame),
-                    11 => draw_cat(26, 10, 4, action_frame),
-                    12..=14 => draw_cat(25, 10, 3, action_frame),
-                    15 => draw_cat(45, 14, 1, action_frame),
-                    16 => draw_cat(70, 14, 1, action_frame),
-                    _ => draw_cat(94, 14, 1, action_frame),
-                },
-                1 => match action_frame {
-                    0 => draw_cat(98, 14, 1, action_frame),
-                    1 => draw_cat(94, 14, 1, action_frame),
-                    2 => draw_cat(90, 14, 1, action_frame),
-                    3 => draw_cat(86, 14, 1, action_frame),
-                    4 => draw_cat(82, 8, 4, action_frame),
-                    5 => draw_cat(82, 3, 4, action_frame),
-                    6..=9 => draw_cat(82, 2, 2, action_frame),
-                    10 => draw_cat(82, 7, 4, action_frame),
-                    11 => draw_cat(86, 14, 1, action_frame),
-                    12 => draw_cat(90, 14, 1, action_frame),
-                    13 => draw_cat(94, 14, 1, action_frame),
-                    _ => draw_cat(98, 14, 1, action_frame),
-                },
-                _ => match action_frame {
-                    0 => draw_cat(98, 14, 1, action_frame),
-                    1 => draw_cat(90, 14, 1, action_frame),
-                    2 => draw_cat(82, 14, 1, action_frame),
-                    3 => draw_cat(74, 14, 1, action_frame),
-                    4 => draw_cat(66, 14, 1, action_frame),
-                    5 => draw_cat(58, 14, 1, action_frame),
-                    6 => draw_cat(50, 14, 1, action_frame),
-                    7 => draw_cat(42, 14, 1, action_frame),
-                    8 => draw_cat(34, 14, 1, action_frame),
-                    9 => draw_cat(26, 14, 1, action_frame),
-                    10 => draw_cat(30, 14, 1, action_frame),
-                    11 => draw_cat(42, 14, 1, action_frame),
-                    12 => draw_cat(54, 14, 1, action_frame),
-                    13 => draw_cat(66, 14, 1, action_frame),
-                    14 => draw_cat(78, 14, 1, action_frame),
-                    15 => draw_cat(88, 14, 1, action_frame),
-                    16 => draw_cat(96, 14, 1, action_frame),
-                    _ => draw_cat(98, 14, 1, action_frame),
-                },
-            }
-        } else {
-            let sleep_y = if idle_frame == 1 { 12 } else { 13 };
-            draw_cat(98, sleep_y, 0, idle_frame);
-        }
-
-        // The front rim creates depth and makes it clear the cat is lying in the nest.
-        fill_cell(97, 19, 11, 3, nest_shadow);
-        fill_cell(99, 19, 8, 1, nest_light);
-        fill_cell(99, 20, 8, 1, nest_mid);
-        fill_cell(97, 21, 11, 1, nest_shadow);
-
-        // Two quiet sleep pixels appear only while the cat is in its nest.
-        if action_code.is_none() {
-            fill_cell(100, 10, 1, 1, floor);
-            fill_cell(102, 9, 1, 2, floor);
-        }
-
+        let _ = IntersectClipRect(
+            hdc,
+            rect.right - reveal_width,
+            rect.top,
+            rect.right,
+            rect.bottom,
+        );
+        // COLORONCOLOR preserves hard pixel edges, including fractional Windows DPI scales.
+        SetStretchBltMode(hdc, COLORONCOLOR);
+        StretchDIBits(
+            hdc,
+            x,
+            y,
+            art_width,
+            art_height,
+            0,
+            0,
+            crate::pixel_room::WIDTH as i32,
+            crate::pixel_room::HEIGHT as i32,
+            Some(pixels.as_ptr().cast()),
+            &bmi,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
         let _ = RestoreDC(hdc, saved);
     }
 }
