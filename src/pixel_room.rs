@@ -102,10 +102,10 @@ fn plant(c: &mut Canvas, x: i32, y: i32, p: &Palette) {
 
 /// RGB pixels in the layout expected by a 32-bit BI_RGB DIB (0x00RRGGBB).
 /// Frames 0..IDLE_FRAMES are quiet loops; subsequent ranges are cat stories.
-pub fn render(hour: u16, frame: usize) -> Vec<u32> {
+pub fn render(hour: u16, frame: usize, background: u32) -> Vec<u32> {
     let p = palette(hour);
     let mut c = Canvas {
-        pixels: vec![p.wall; WIDTH * HEIGHT],
+        pixels: vec![background; WIDTH * HEIGHT],
     };
     let night = !(5..20).contains(&hour);
     let beat = if frame < IDLE_FRAMES {
@@ -114,12 +114,25 @@ pub fn render(hour: u16, frame: usize) -> Vec<u32> {
         ((frame - IDLE_FRAMES) / 3) % IDLE_FRAMES
     };
 
-    // A cutaway with warm plaster, a dado rail and staggered floorboards.
-    c.rect(0, 0, 216, 1, p.wall_shade);
-    c.rect(0, 1, 1, 46, p.wall_shade);
-    c.rect(215, 1, 1, 46, p.wall_shade);
-    c.rect(1, 31, 214, 4, p.wall_shade);
-    c.rect(1, 34, 214, 1, p.wood_light);
+    // Open plaster islands, rather than a rectangular room pasted onto the card.
+    // Discrete colour steps preserve pixel edges while easing into either theme.
+    let tint = |color: u32, weight: u32| -> u32 {
+        let channel = |shift: u32| {
+            ((((background >> shift) & 255) * (100 - weight) + ((color >> shift) & 255) * weight)
+                / 100)
+                << shift
+        };
+        channel(16) | channel(8) | channel(0)
+    };
+    c.rect(76, 9, 31, 28, tint(p.wall, 22));
+    c.rect(79, 12, 29, 24, tint(p.wall, 38));
+    c.rect(109, 1, 54, 31, tint(p.wall, 18));
+    c.rect(107, 5, 58, 24, tint(p.wall, 18));
+    c.rect(110, 3, 52, 27, tint(p.wall, 38));
+    c.rect(113, 6, 47, 25, tint(p.wall, 58));
+
+    // One continuous floor grounds the entire room. Only the outer silhouette
+    // steps inward, leaving a clean edge against the card.
     c.rect(0, 35, 216, 13, p.floor);
     for y in [39, 44, 47] {
         c.rect(0, y, 216, 1, p.seam);
@@ -151,6 +164,22 @@ pub fn render(hour: u16, frame: usize) -> Vec<u32> {
     ] {
         c.rect(x, y, w, 1, p.wood_light);
     }
+    for y in 35..48 {
+        let (left, right) = match y {
+            35..=38 => (7, 213),
+            39..=42 => (4, 214),
+            43..=44 => (8, 212),
+            45..=46 => (14, 208),
+            _ => (20, 202),
+        };
+        for x in 0..WIDTH as i32 {
+            if x < left || x >= right {
+                c.rect(x, y, 1, 1, background);
+            }
+        }
+    }
+    // Hard-edged contact shadows, not a blurred vignette.
+    c.rect(20, 47, 182, 1, tint(p.wood_shade, 18));
 
     // Recessed window: a miniature skyline, clouds and four glazed panes.
     c.rect(113, 3, 47, 28, p.wall_shade);

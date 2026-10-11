@@ -2086,7 +2086,11 @@ fn draw_pet_scene(
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|hour| *hour < 24)
         .unwrap_or_else(|| unsafe { GetLocalTime().wHour });
-    let pixels = crate::pixel_room::render(hour, frame);
+    // Match the already-painted card, so negative space works in both themes.
+    let card_color = unsafe { GetPixel(hdc, rect.left, rect.top) }.0;
+    let background =
+        ((card_color & 0xff) << 16) | (card_color & 0xff00) | ((card_color >> 16) & 0xff);
+    let pixels = crate::pixel_room::render(hour, frame, background);
     let scale = (scene_width as f64 / crate::pixel_room::WIDTH as f64)
         .min(scene_height as f64 / crate::pixel_room::HEIGHT as f64);
     let art_width = (crate::pixel_room::WIDTH as f64 * scale).round() as i32;
