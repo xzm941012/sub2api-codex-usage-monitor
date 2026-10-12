@@ -73,6 +73,7 @@ struct AppState {
     show_codex: bool,
     placement_mode: PlacementMode,
     widget_theme: WidgetTheme,
+    season: crate::pixel_room::Season,
     progress_color_mode: ProgressColorMode,
     floating_x: Option<i32>,
     floating_y: Option<i32>,
@@ -217,6 +218,8 @@ const IDM_THEME_LIGHT: u16 = 72;
 const IDM_THEME_DARK: u16 = 73;
 const IDM_COLOR_MONO: u16 = 74;
 const IDM_COLOR_ANTD: u16 = 75;
+const IDM_SEASON_AUTO: u16 = 80;
+const IDM_SEASON_WINTER: u16 = 84;
 const IDM_LANG_SYSTEM: u16 = 100;
 const IDM_LANG_ENGLISH: u16 = 101;
 const IDM_LANG_DUTCH: u16 = 102;
@@ -340,6 +343,8 @@ struct SettingsFile {
     #[serde(default)]
     widget_theme: WidgetTheme,
     #[serde(default)]
+    season: crate::pixel_room::Season,
+    #[serde(default)]
     progress_color_mode: ProgressColorMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     floating_x: Option<i32>,
@@ -379,6 +384,7 @@ impl Default for SettingsFile {
             show_codex: true,
             placement_mode: PlacementMode::Fixed,
             widget_theme: WidgetTheme::Dark,
+            season: crate::pixel_room::Season::Auto,
             progress_color_mode: ProgressColorMode::Mono,
             floating_x: None,
             floating_y: None,
@@ -446,6 +452,7 @@ fn save_state_settings() {
             show_codex: s.show_codex,
             placement_mode: s.placement_mode,
             widget_theme: s.widget_theme,
+            season: s.season,
             progress_color_mode: s.progress_color_mode,
             floating_x: s.floating_x,
             floating_y: s.floating_y,
@@ -1420,6 +1427,7 @@ pub fn run() {
                 show_codex: settings.show_codex,
                 placement_mode: settings.placement_mode,
                 widget_theme: settings.widget_theme,
+                season: settings.season,
                 progress_color_mode: settings.progress_color_mode,
                 floating_x: settings.floating_x,
                 floating_y: settings.floating_y,
@@ -2090,7 +2098,26 @@ fn draw_pet_scene(
     let card_color = unsafe { GetPixel(hdc, rect.left, rect.top) }.0;
     let background =
         ((card_color & 0xff) << 16) | (card_color & 0xff00) | ((card_color >> 16) & 0xff);
-    let pixels = crate::pixel_room::render(hour, frame, background);
+    let (ambient_ms, season) = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| {
+                (
+                    if s.pet_motion_enabled {
+                        s.pet_animation_started.elapsed().as_millis() as u64
+                    } else {
+                        0
+                    },
+                    s.season.resolve(unsafe { GetLocalTime().wMonth }),
+                )
+            })
+            .unwrap_or((
+                0,
+                crate::pixel_room::Season::Auto.resolve(unsafe { GetLocalTime().wMonth }),
+            ))
+    };
+    let pixels = crate::pixel_room::render(hour, frame, background, ambient_ms, season);
     let scale = (scene_width as f64 / crate::pixel_room::WIDTH as f64)
         .min(scene_height as f64 / crate::pixel_room::HEIGHT as f64);
     let art_width = (crate::pixel_room::WIDTH as f64 * scale).round() as i32;
@@ -3719,6 +3746,20 @@ unsafe extern "system" fn wnd_proc(
                     position_at_taskbar();
                     render_layered();
                 }
+                IDM_SEASON_AUTO..=IDM_SEASON_WINTER => {
+                    let selected = [
+                        crate::pixel_room::Season::Auto,
+                        crate::pixel_room::Season::Spring,
+                        crate::pixel_room::Season::Summer,
+                        crate::pixel_room::Season::Autumn,
+                        crate::pixel_room::Season::Winter,
+                    ][(id - IDM_SEASON_AUTO) as usize];
+                    if let Some(s) = lock_state().as_mut() {
+                        s.season = selected;
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
                 IDM_THEME_LIGHT | IDM_THEME_DARK => {
                     {
                         let mut state = lock_state();
@@ -5177,6 +5218,38 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             placement_menu.0 as usize,
             PCWSTR::from_raw(placement_label.as_ptr()),
+        );
+
+        let selected_season = lock_state().as_ref().map(|s| s.season).unwrap_or_default();
+        let season_menu = CreatePopupMenu().unwrap();
+        for (idx, (season, label)) in [
+            (crate::pixel_room::Season::Auto, "自动（跟随月份）"),
+            (crate::pixel_room::Season::Spring, "春季"),
+            (crate::pixel_room::Season::Summer, "夏季"),
+            (crate::pixel_room::Season::Autumn, "秋季"),
+            (crate::pixel_room::Season::Winter, "冬季"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let label = native_interop::wide_str(label);
+            let _ = AppendMenuW(
+                season_menu,
+                if *season == selected_season {
+                    MF_CHECKED
+                } else {
+                    MENU_ITEM_FLAGS(0)
+                },
+                IDM_SEASON_AUTO as usize + idx,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
+        let season_label = native_interop::wide_str("季节");
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            season_menu.0 as usize,
+            PCWSTR::from_raw(season_label.as_ptr()),
         );
 
         let theme_menu = CreatePopupMenu().unwrap();

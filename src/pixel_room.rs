@@ -6,6 +6,31 @@ pub const HEIGHT: usize = 48;
 pub const IDLE_FRAMES: usize = 8;
 pub const ACTION_FRAMES: usize = 48;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Season {
+    #[default]
+    Auto,
+    Spring,
+    Summer,
+    Autumn,
+    Winter,
+}
+
+impl Season {
+    pub fn resolve(self, month: u16) -> Self {
+        if self != Self::Auto {
+            return self;
+        }
+        match month {
+            3..=5 => Self::Spring,
+            6..=8 => Self::Summer,
+            9..=11 => Self::Autumn,
+            _ => Self::Winter,
+        }
+    }
+}
+
 struct Canvas {
     pixels: Vec<u32>,
 }
@@ -102,7 +127,13 @@ fn plant(c: &mut Canvas, x: i32, y: i32, p: &Palette) {
 
 /// RGB pixels in the layout expected by a 32-bit BI_RGB DIB (0x00RRGGBB).
 /// Frames 0..IDLE_FRAMES are quiet loops; subsequent ranges are cat stories.
-pub fn render(hour: u16, frame: usize, background: u32) -> Vec<u32> {
+pub fn render(
+    hour: u16,
+    frame: usize,
+    background: u32,
+    ambient_ms: u64,
+    season: Season,
+) -> Vec<u32> {
     let p = palette(hour);
     let mut c = Canvas {
         pixels: vec![background; WIDTH * HEIGHT],
@@ -206,9 +237,19 @@ pub fn render(hour: u16, frame: usize, background: u32) -> Vec<u32> {
             &[(b's', p.light)],
             false,
         );
-        c.rect(122, 9, 7, 2, 0xf5eee0);
-        c.rect(125, 8, 3, 1, 0xf5eee0);
-        c.rect(135, 12, 7, 1, 0xf5eee0);
+    }
+    // Clouds travel independently of the cat/typing loops. Wrap outside the
+    // glazing and clip before drawing mullions, so they never cross the wall.
+    let cloud_color = if night { 0x69738f } else { 0xf5eee0 };
+    for (offset, y, speed) in [(4u64, 8, 650u64), (30, 12, 950)] {
+        let cloud_x = 107 + ((ambient_ms / speed + offset) % 55) as i32;
+        for (dx, dy, w, h) in [(3, 0, 4, 1), (1, 1, 8, 1), (0, 2, 11, 1)] {
+            let left = (cloud_x + dx).max(118);
+            let right = (cloud_x + dx + w).min(155);
+            if right > left {
+                c.rect(left, y + dy, right - left, h, cloud_color);
+            }
+        }
     }
     for (x, y, w) in [
         (118, 22, 7),
@@ -220,21 +261,110 @@ pub fn render(hour: u16, frame: usize, background: u32) -> Vec<u32> {
         c.rect(x, y, w, 26 - y, p.distant);
         c.rect(x + 2, y + 2, 1, 1, if night { p.light } else { p.horizon });
     }
+    // Seasonal foreground lives behind the glazing, leaving sky and skyline visible.
+    let outside = |color: u32| -> u32 {
+        if !night {
+            return color;
+        }
+        let component = |shift: u32| (((color >> shift) & 255) * 55 / 100) << shift;
+        component(16) | component(8) | component(0)
+    };
+    let (leaf, bright) = match season {
+        Season::Spring => (0x83a779, 0xc5d39a),
+        Season::Summer => (0x528879, 0x90b477),
+        Season::Autumn | Season::Auto => (0xb65d54, 0xe5a068),
+        Season::Winter => (0xc4d2d7, 0xf2f0e5),
+    };
+    for (x, y) in [(122, 13), (144, 16)] {
+        c.rect(x + 4, y + 6, 2, 26 - (y + 6), outside(0x886d6b));
+        c.rect(x + 2, y + 6, 3, 1, outside(0x886d6b));
+        c.rect(x + 5, y + 4, 3, 1, outside(0x886d6b));
+        if season == Season::Winter {
+            c.rect(x + 1, y + 5, 4, 1, outside(bright));
+            c.rect(x + 5, y + 3, 4, 1, outside(bright));
+            c.rect(x + 4, y + 1, 2, 3, outside(0x886d6b));
+        } else {
+            c.sprite(
+                x,
+                y,
+                &[
+                    "...llll...",
+                    "..llLLll..",
+                    ".lllLLlll.",
+                    "llLLllllll",
+                    "llLLlllLll",
+                    ".lllllLLl.",
+                    "..llllll..",
+                ],
+                &[(b'l', outside(leaf)), (b'L', outside(bright))],
+                false,
+            );
+            if season == Season::Spring {
+                for (dx, dy) in [(2, 2), (6, 3), (4, 5)] {
+                    c.rect(x + dx, y + dy, 1, 1, outside(0xe3b1bc));
+                }
+            }
+        }
+    }
+    if season == Season::Winter {
+        c.rect(118, 25, 37, 1, outside(0xe4e9e6));
+    }
+    if season != Season::Summer {
+        let count = if season == Season::Winter { 9 } else { 4 };
+        for i in 0..count {
+            let period = 5_000 + i as u64 * 370;
+            let t = ((ambient_ms + i as u64 * 1_213) % period) as f64 / period as f64;
+            let drift = (t * std::f64::consts::TAU + i as f64).sin() * 2.0;
+            let base_x = if season == Season::Winter {
+                120 + i * 4
+            } else {
+                125 + (i * 7) % 25
+            };
+            let x = base_x + drift.round() as i32;
+            let y = 6 + (t * 20.0) as i32;
+            let color = match season {
+                Season::Winter => 0xe7ecea,
+                Season::Spring => 0xe9b9c4,
+                _ => {
+                    if i % 2 == 0 {
+                        0xd88253
+                    } else {
+                        0xb85950
+                    }
+                }
+            };
+            if (118..155).contains(&x) && (5..26).contains(&y) {
+                c.rect(x, y, 1, 1, outside(color));
+                if season == Season::Autumn && y < 25 && x < 154 {
+                    c.rect(x + 1, y + 1, 1, 1, outside(color));
+                }
+            }
+        }
+    }
     c.rect(136, 5, 2, 21, p.wood_light);
     c.rect(118, 15, 37, 2, p.wood_light);
     c.rect(117, 26, 39, 2, p.wood);
     c.rect(113, 28, 47, 2, p.wood_light);
     c.rect(114, 30, 45, 1, p.wood_shade);
-    // Rose linen curtains have fixed tops and gently moving lower hems.
-    let sway = if matches!(beat, 3..=5) { 1 } else { 0 };
-    for (x, sign) in [(111, 1), (154, -1)] {
+    if season == Season::Winter {
+        c.rect(118, 27, 37, 1, outside(0xf2f0e5));
+    }
+    // The rod and tiebacks stay fixed. Each lower row bends a little farther
+    // with the breeze; the two panels have slightly different phases.
+    let breeze = ambient_ms as f64 / 5_600.0 * std::f64::consts::TAU;
+    let sway = breeze.sin().round() as i32;
+    for (x, phase) in [(111, 0.0), (154, 0.65)] {
         c.rect(x, 5, 7, 11, 0xb77980);
         c.rect(x + 1, 5, 2, 10, 0xd99d9a);
         c.rect(x + 4, 5, 1, 10, 0xe8b7a6);
         c.rect(x + 1, 15, 5, 2, p.wood_light);
-        c.rect(x + sway * sign, 17, 7, 9, 0xc58a8c);
-        c.rect(x + 1 + sway * sign, 17, 2, 9, 0xe1aba4);
-        c.rect(x + 5 + sway * sign, 17, 1, 9, 0xa96e7b);
+        for row in 0..9 {
+            let bend = ((breeze + phase - row as f64 * 0.08).sin() * row as f64 / 8.0 * 3.0).round()
+                as i32;
+            c.rect(x + bend, 17 + row, 7, 1, 0xc58a8c);
+            c.rect(x + 1 + bend, 17 + row, 2, 1, 0xe1aba4);
+            c.rect(x + 5 + bend, 17 + row, 1, 1, 0xa96e7b);
+        }
     }
     c.rect(109, 3, 54, 1, p.ink);
     c.rect(108, 3, 2, 2, p.wood_light);
